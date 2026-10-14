@@ -236,12 +236,15 @@ mod tests {
     use rcgen::{CertificateParams, KeyPair};
     use rustls::crypto::aws_lc_rs::cipher_suite as aws_suite;
     use rustls::crypto::aws_lc_rs::kx_group as aws;
-    use rustls::crypto::{CryptoProvider, SupportedKxGroup};
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+    use rustls::crypto::{CryptoProvider, SupportedKxGroup, WebPkiSupportedAlgorithms};
+    use rustls::pki_types::{
+        alg_id, CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName,
+        SignatureVerificationAlgorithm,
+    };
     use rustls::sign::{CertifiedKey, SingleCertAndKey};
     use rustls::{
         CipherSuite, ClientConfig, ClientConnection, Connection, NamedGroup, RootCertStore,
-        ServerConfig, ServerConnection,
+        ServerConfig, ServerConnection, SignatureScheme,
     };
 
     use super::{
@@ -448,17 +451,67 @@ mod tests {
         );
     }
 
+    /// The TLS signature schemes a classical peer verifies.
+    const CLASSICAL_SCHEMES: &[SignatureScheme] = &[
+        SignatureScheme::ECDSA_NISTP256_SHA256,
+        SignatureScheme::ECDSA_NISTP384_SHA384,
+        SignatureScheme::ECDSA_NISTP521_SHA512,
+        SignatureScheme::ED25519,
+        SignatureScheme::RSA_PSS_SHA256,
+        SignatureScheme::RSA_PSS_SHA384,
+        SignatureScheme::RSA_PSS_SHA512,
+        SignatureScheme::RSA_PKCS1_SHA256,
+        SignatureScheme::RSA_PKCS1_SHA384,
+        SignatureScheme::RSA_PKCS1_SHA512,
+    ];
+
+    /// rustls' aws-lc-rs default verification list with every ML-DSA algorithm removed, from the handshake
+    /// schemes and from the certificate algorithms alike: a peer that verifies classically by construction.
+    fn classical_verification() -> WebPkiSupportedAlgorithms {
+        let ml_dsa = [alg_id::ML_DSA_44, alg_id::ML_DSA_65, alg_id::ML_DSA_87];
+        let default =
+            rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms;
+        let all: Vec<&'static dyn SignatureVerificationAlgorithm> = default
+            .all
+            .iter()
+            .copied()
+            .filter(|a| !ml_dsa.contains(&a.public_key_alg_id()))
+            .collect();
+        let mapping: Vec<(
+            SignatureScheme,
+            &'static [&'static dyn SignatureVerificationAlgorithm],
+        )> = default
+            .mapping
+            .iter()
+            .copied()
+            .filter(|(scheme, _)| CLASSICAL_SCHEMES.contains(scheme))
+            .collect();
+        WebPkiSupportedAlgorithms {
+            all: Box::leak(all.into_boxed_slice()),
+            mapping: Box::leak(mapping.into_boxed_slice()),
+        }
+    }
+
     /// ⛔ THE SIGNATURE NEGATIVE CONTROL, both roles. A server that signs classically cannot agree with our client,
     /// and a client that verifies only classical signatures cannot agree with our server. Each peer keeps our key
     /// exchange groups, so the signature is the only thing that can have failed.
     #[test]
     fn a_classical_signature_cannot_agree_with_us() {
         let classical_signatures = || CryptoProvider {
-            signature_verification_algorithms: rustls::crypto::aws_lc_rs::default_provider()
-                .signature_verification_algorithms,
+            signature_verification_algorithms: classical_verification(),
             key_provider: rustls::crypto::aws_lc_rs::default_provider().key_provider,
             ..provider()
         };
+        // The premise, checked rather than inherited: since rustls 0.23.46 the aws-lc-rs default also verifies
+        // ML-DSA, so the peer's list is that default with ML-DSA cut out, and it must hold nothing else.
+        let schemes = classical_signatures()
+            .signature_verification_algorithms
+            .supported_schemes();
+        assert!(!schemes.is_empty());
+        assert!(
+            schemes.iter().all(|s| CLASSICAL_SCHEMES.contains(s)),
+            "the classical peer verifies something not classical: {schemes:?}"
+        );
         let classical = Identity::classical();
         let ours = Identity::new();
         let we_dial = handshake(
