@@ -120,9 +120,15 @@ jobs:
       - name: Publishing plan
         run: ./scripts/publish-crates.sh --plan
 
+
+  # The release guard. version-root names the directory whose manifest
+  # carries the version this repository publishes; the default is the root.
+  release-guard:
+    name: The release guard
+    uses: macula-io/macula-ci-images/.github/workflows/release-guard.yml@2660ee4ce1c51ce3d2bf14043ebc8a2784065cd9
   publish:
     name: Publish to crates.io
-    needs: verify
+    needs: [verify, release-guard]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: crates-io
