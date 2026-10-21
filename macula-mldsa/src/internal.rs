@@ -510,8 +510,11 @@ fn z_and_r0(
         let mut cs1 = [0i32; N];
         multiply_add_ntt(&mut cs1, c_hat, s1_s);
         ntt_inverse(&mut cs1);
-        for ((z_i, y_i), cs1_i) in round.z[s].iter_mut().zip(round.y[s]).zip(cs1) {
-            *z_i = add(y_i, cs1_i);
+        // By reference, every one of these: a by-value zip over an [i32; N]
+        // copies the array onto the stack, and y and c*s1 are secret-derived,
+        // so those copies would outlive the zeroize below.
+        for ((z_i, y_i), cs1_i) in round.z[s].iter_mut().zip(round.y[s].iter()).zip(cs1.iter()) {
+            *z_i = add(*y_i, *cs1_i);
         }
         cs1.zeroize();
     }
@@ -519,8 +522,12 @@ fn z_and_r0(
         round.cs2[r].fill(0);
         multiply_add_ntt(&mut round.cs2[r], c_hat, s2_r);
         ntt_inverse(&mut round.cs2[r]);
-        for ((r0_i, w_i), cs2_i) in round.r0[r].iter_mut().zip(round.w[r]).zip(round.cs2[r]) {
-            *r0_i = from_signed(low_bits(sub(w_i, cs2_i), p.gamma2));
+        for ((r0_i, w_i), cs2_i) in round.r0[r]
+            .iter_mut()
+            .zip(round.w[r].iter())
+            .zip(round.cs2[r].iter())
+        {
+            *r0_i = from_signed(low_bits(sub(*w_i, *cs2_i), p.gamma2));
         }
     }
 }
@@ -539,13 +546,15 @@ fn make_hints(
         ct0[r].fill(0);
         multiply_add_ntt(&mut ct0[r], c_hat, t0_r);
         ntt_inverse(&mut ct0[r]);
+        // By reference for the same reason as z_and_r0: w and c*s2 are
+        // secret-derived, and a by-value zip would copy them to the stack.
         for ((hint_i, w_i), (cs2_i, ct0_i)) in round.hint[r]
             .iter_mut()
-            .zip(round.w[r])
+            .zip(round.w[r].iter())
             .zip(round.cs2[r].iter().zip(ct0[r].iter()))
         {
             let minus_ct0 = sub(0, *ct0_i);
-            let base = add(sub(w_i, *cs2_i), *ct0_i);
+            let base = add(sub(*w_i, *cs2_i), *ct0_i);
             *hint_i = make_hint(minus_ct0, base, p.gamma2);
             ones += *hint_i as usize;
         }
