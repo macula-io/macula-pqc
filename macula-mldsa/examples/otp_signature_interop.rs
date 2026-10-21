@@ -60,100 +60,139 @@ fn main() {
         dir: dir.clone(),
     };
 
-    let mut interop_failed = false;
-    let mut control_failed = false;
+    let mut cases = Cases::default();
     for (p, alg) in SETS {
         println!("{}", p.name);
-        let mut case = |name: &str, pass: bool, control: bool| {
-            println!("  {name:<66} {}", if pass { "PASS" } else { "FAIL" });
-            if control {
-                control_failed |= !pass;
-            } else {
-                interop_failed |= !pass;
-            }
-        };
-        let msg = format!("{} interop", p.name).into_bytes();
-        let other = b"another message".to_vec();
-
-        // An OTP key: its public key, derived here from the expanded form.
-        let (pk_otp, sk_otp) = otp.keygen(alg);
-        case(
-            "OTP key: public key derived here from its expanded form matches",
-            public_key(p, PrivateKey::Expanded(&sk_otp)).as_deref() == Ok(&pk_otp[..]),
-            false,
-        );
-
-        // A key of ours: its public key, derived by OTP from the expanded form.
-        let seed = [0x6du8; 32];
-        let (pk_ours, sk_ours) = internal::key_gen(p, &seed);
-        case(
-            "our key: public key derived by OTP from its expanded form matches",
-            otp.derive(alg, &sk_ours) == pk_ours,
-            false,
-        );
-
-        // OTP signs; we verify.
-        let sig = otp.sign(alg, "expandedkey", &sk_otp, &msg);
-        case(
-            "OTP signs with its key, we verify",
-            verify(p, &pk_otp, &msg, &sig, b"") == Ok(true),
-            false,
-        );
-        case(
-            "  ... and refuse it on another message",
-            verify(p, &pk_otp, &other, &sig, b"") == Ok(false),
-            true,
-        );
-        let sig = otp.sign(alg, "expandedkey", &sk_ours, &msg);
-        case(
-            "OTP signs with our key expanded, we verify",
-            verify(p, &pk_ours, &msg, &sig, b"") == Ok(true),
-            false,
-        );
-        let sig = otp.sign(alg, "seed", &seed, &msg);
-        case(
-            "OTP signs with our key's seed, we verify under our derived key",
-            verify(p, &pk_ours, &msg, &sig, b"") == Ok(true),
-            false,
-        );
-
-        // We sign; OTP verifies.
-        let sig = sign(p, PrivateKey::Expanded(&sk_otp), &msg, b"").unwrap();
-        case(
-            "we sign with OTP's key, OTP verifies",
-            otp.verify(alg, &pk_otp, &msg, &sig),
-            false,
-        );
-        case(
-            "  ... and refuses it on another message",
-            !otp.verify(alg, &pk_otp, &other, &sig),
-            true,
-        );
-        let sig = sign(p, PrivateKey::Seed(&seed), &msg, b"").unwrap();
-        case(
-            "we sign with our key as its seed, OTP verifies",
-            otp.verify(alg, &pk_ours, &msg, &sig),
-            false,
-        );
-        let sig = sign(p, PrivateKey::Seed(&seed), &msg, b"ctx").unwrap();
-        case(
-            "  ... and refuses one made under a context it cannot see",
-            !otp.verify(alg, &pk_ours, &msg, &sig),
-            true,
-        );
+        let keys = one_set(p, alg, &otp, &mut cases);
+        we_sign_otp_verifies(p, alg, &otp, &keys, &mut cases);
         println!();
     }
     let _ = std::fs::remove_dir_all(&dir);
 
-    if control_failed {
+    if cases.control_failed {
         println!("NEGATIVE CONTROL FAILED: a signature was accepted where it must not be.");
         std::process::exit(2);
     }
-    if interop_failed {
+    if cases.interop_failed {
         println!("INTEROP FAILED: see the cases marked FAIL.");
         std::process::exit(1);
     }
     println!("macula-mldsa and OTP's crypto agree on public keys and on each other's signatures, at all three sets.");
+}
+
+/// The tally of one run: an interop case, and a negative control that must
+/// not be accepted.
+#[derive(Default)]
+struct Cases {
+    interop_failed: bool,
+    control_failed: bool,
+}
+
+impl Cases {
+    fn check(&mut self, name: &str, pass: bool, control: bool) {
+        println!("  {name:<66} {}", if pass { "PASS" } else { "FAIL" });
+        if control {
+            self.control_failed |= !pass;
+            return;
+        }
+        self.interop_failed |= !pass;
+    }
+}
+
+/// Both keys of one set, and the checks that each side derives the other's
+/// public key.
+struct Keys {
+    pk_otp: Vec<u8>,
+    sk_otp: Vec<u8>,
+    pk_ours: Vec<u8>,
+    seed: [u8; 32],
+}
+
+/// One set: the two keys, the public keys that must agree, and OTP signing
+/// what this crate verifies.
+fn one_set(p: ParameterSet, alg: &str, otp: &Otp, cases: &mut Cases) -> Keys {
+    let msg = format!("{} interop", p.name).into_bytes();
+    let other = b"another message".to_vec();
+
+    // An OTP key: its public key, derived here from the expanded form.
+    let (pk_otp, sk_otp) = otp.keygen(alg);
+    cases.check(
+        "OTP key: public key derived here from its expanded form matches",
+        public_key(p, PrivateKey::Expanded(&sk_otp)).as_deref() == Ok(&pk_otp[..]),
+        false,
+    );
+
+    // A key of ours: its public key, derived by OTP from the expanded form.
+    let seed = [0x6du8; 32];
+    let (pk_ours, sk_ours) = internal::key_gen(p, &seed);
+    cases.check(
+        "our key: public key derived by OTP from its expanded form matches",
+        otp.derive(alg, &sk_ours) == pk_ours,
+        false,
+    );
+
+    // OTP signs; we verify.
+    let sig = otp.sign(alg, "expandedkey", &sk_otp, &msg);
+    cases.check(
+        "OTP signs with its key, we verify",
+        verify(p, &pk_otp, &msg, &sig, b"") == Ok(true),
+        false,
+    );
+    cases.check(
+        "  ... and refuse it on another message",
+        verify(p, &pk_otp, &other, &sig, b"") == Ok(false),
+        true,
+    );
+    let sig = otp.sign(alg, "expandedkey", &sk_ours, &msg);
+    cases.check(
+        "OTP signs with our key expanded, we verify",
+        verify(p, &pk_ours, &msg, &sig, b"") == Ok(true),
+        false,
+    );
+    let sig = otp.sign(alg, "seed", &seed, &msg);
+    cases.check(
+        "OTP signs with our key's seed, we verify under our derived key",
+        verify(p, &pk_ours, &msg, &sig, b"") == Ok(true),
+        false,
+    );
+
+    Keys {
+        pk_otp,
+        sk_otp,
+        pk_ours,
+        seed,
+    }
+}
+
+/// One set, the other way round: this crate signs and OTP verifies, with
+/// the negative controls that make those cases mean anything.
+fn we_sign_otp_verifies(p: ParameterSet, alg: &str, otp: &Otp, keys: &Keys, cases: &mut Cases) {
+    let msg = format!("{} interop", p.name).into_bytes();
+    let other = b"another message".to_vec();
+
+    let sig = sign(p, PrivateKey::Expanded(&keys.sk_otp), &msg, b"").unwrap();
+    cases.check(
+        "we sign with OTP's key, OTP verifies",
+        otp.verify(alg, &keys.pk_otp, &msg, &sig),
+        false,
+    );
+    cases.check(
+        "  ... and refuses it on another message",
+        !otp.verify(alg, &keys.pk_otp, &other, &sig),
+        true,
+    );
+    let sig = sign(p, PrivateKey::Seed(&keys.seed), &msg, b"").unwrap();
+    cases.check(
+        "we sign with our key as its seed, OTP verifies",
+        otp.verify(alg, &keys.pk_ours, &msg, &sig),
+        false,
+    );
+    let sig = sign(p, PrivateKey::Seed(&keys.seed), &msg, b"ctx").unwrap();
+    cases.check(
+        "  ... and refuses one made under a context it cannot see",
+        !otp.verify(alg, &keys.pk_ours, &msg, &sig),
+        true,
+    );
 }
 
 /// The OTP release and the library its `crypto` is built on, checked for

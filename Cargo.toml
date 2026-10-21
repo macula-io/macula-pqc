@@ -24,6 +24,15 @@ license = "Apache-2.0"
 repository = "https://github.com/macula-io/macula-pqc"
 categories = ["cryptography"]
 
+# The structural floor: a function's nesting depth, its cognitive
+# complexity and its length are hard limits, denied in this workspace and so
+# gated by the `cargo clippy ... -D warnings` in scripts/test.sh. The
+# thresholds they are measured against are in clippy.toml.
+[workspace.lints.clippy]
+excessive_nesting = "deny"
+cognitive_complexity = "deny"
+too_many_lines = "deny"
+
 [workspace.dependencies]
 # This workspace's own crates: by path to build here, and by version
 # because crates.io refuses a dependency that has only a path. Bump these

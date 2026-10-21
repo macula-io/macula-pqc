@@ -38,24 +38,34 @@ fn sample_ntt_depends_on_its_seed() {
     );
 }
 
+/// A coefficient folded to the centre of the ring: values above q/2 wrap
+/// to negative, so the support comes back as [-eta, eta].
+fn centred(c: i16) -> i32 {
+    if c as i32 > Q / 2 {
+        c as i32 - Q
+    } else {
+        c as i32
+    }
+}
+
+/// One drawn polynomial, every coefficient checked to lie in [-eta, eta].
+fn assert_cbd_is_centred(eta: usize, byte: u8) {
+    let f = sample_poly_cbd(eta, &prf(eta, &[byte; 32], 0));
+    for &c in f.iter() {
+        assert!(
+            centred(c).abs() <= eta as i32,
+            "eta = {eta}: coefficient {c} is outside [-{eta}, {eta}]"
+        );
+    }
+}
+
 /// The centred binomial distribution is supported on [-eta, eta], which
 /// after folding is [0, eta] together with [q-eta, q).
 #[test]
 fn sample_poly_cbd_is_supported_on_the_centred_binomial_range() {
     for eta in [2usize, 3] {
         for byte in 0u8..4 {
-            let f = sample_poly_cbd(eta, &prf(eta, &[byte; 32], 0));
-            for &c in f.iter() {
-                let centred = if c as i32 > Q / 2 {
-                    c as i32 - Q
-                } else {
-                    c as i32
-                };
-                assert!(
-                    centred.abs() <= eta as i32,
-                    "eta = {eta}: coefficient {c} is outside [-{eta}, {eta}]"
-                );
-            }
+            assert_cbd_is_centred(eta, byte);
         }
     }
 }

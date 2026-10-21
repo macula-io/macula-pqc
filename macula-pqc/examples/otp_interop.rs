@@ -78,96 +78,10 @@ fn main() {
         dir: dir.clone(),
     };
 
-    let mut interop_failed = false;
-    for (otp_name, expected) in HYBRIDS {
-        for (role, outcome) in [
-            (
-                "OTP dials, we serve",
-                we_serve(&peer, &identity, otp_name, MLDSA87),
-            ),
-            (
-                "we dial, OTP serves",
-                we_dial(&peer, identity.client(), otp_name, "ours"),
-            ),
-        ] {
-            let pass = outcome == Ok(expected);
-            interop_failed |= !pass;
-            println!(
-                "{role:<22} OTP offers {otp_name:<26} {:<34} {}",
-                describe(&outcome),
-                if pass { "PASS" } else { "FAIL" }
-            );
-            if let Err(e) = &outcome {
-                println!("{:<22} {e}", "");
-            }
-        }
-    }
-    let (otp_name, expected) = HYBRIDS[0];
-    let possession = we_dial(&peer, Identity::possession_client(), otp_name, "ours");
-    let pass = possession == Ok(expected);
-    interop_failed |= !pass;
-    println!(
-        "{:<22} {:<37} {:<34} {}",
-        "we dial, OTP serves",
-        "no roots: key possession alone",
-        describe(&possession),
-        if pass { "PASS" } else { "FAIL" }
-    );
-    if let Err(e) = &possession {
-        println!("{:<22} {e}", "");
-    }
-
-    let certificate = peer.run(&["verify_cert"]);
-    interop_failed |= certificate.is_err();
-    println!(
-        "{:<22} {:<37} {:<34} {}",
-        "OTP checks",
-        "our certificate's own signature",
-        "",
-        if certificate.is_ok() { "PASS" } else { "FAIL" }
-    );
-    if let Err(e) = &certificate {
-        println!("{:<22} {e}", "");
-    }
-
-    let mut control_failed = false;
-    for (role, offer, outcome) in [
-        (
-            "OTP dials, we serve",
-            CLASSICAL_ONLY,
-            we_serve(&peer, &identity, CLASSICAL_ONLY, MLDSA87),
-        ),
-        (
-            "we dial, OTP serves",
-            CLASSICAL_ONLY,
-            we_dial(&peer, identity.client(), CLASSICAL_ONLY, "ours"),
-        ),
-        (
-            "OTP dials, we serve",
-            "classical signatures only",
-            we_serve(&peer, &identity, HYBRIDS[0].0, CLASSICAL_SIGNATURES),
-        ),
-        (
-            "we dial, OTP serves",
-            "an Ed25519 certificate",
-            we_dial(&peer, identity.client(), HYBRIDS[0].0, "classical"),
-        ),
-    ] {
-        let pass = outcome.is_err();
-        control_failed |= !pass;
-        println!(
-            "{role:<22} OTP offers {offer:<26} {:<34} {}",
-            describe(&outcome),
-            if pass {
-                "PASS (refused, as required)"
-            } else {
-                "FAIL: a classical peer agreed"
-            }
-        );
-        if let Err(e) = &outcome {
-            println!("{:<22} {e}", "");
-        }
-    }
+    let mut interop_failed = hybrids_interop(&peer, &identity);
+    interop_failed |= !key_possession(&peer);
+    interop_failed |= !our_certificate(&peer);
+    let control_failed = classical_controls(&peer, &identity);
 
     std::fs::remove_dir_all(&dir).unwrap();
     println!();
@@ -183,6 +97,137 @@ fn main() {
         "macula-pqc and OTP's ssl agree on both hybrids and on ML-DSA-87 in both roles; classical key exchange and \
          classical signatures refused."
     );
+}
+
+/// Both hybrids, both roles: OTP dialling and us serving, then the other way
+/// round. `true` when every case did what it had to.
+fn hybrids_interop(peer: &Peer, identity: &Identity) -> bool {
+    let mut failed = false;
+    for (otp_name, expected) in HYBRIDS {
+        let cases = [
+            (
+                "OTP dials, we serve",
+                we_serve(peer, identity, otp_name, MLDSA87),
+            ),
+            (
+                "we dial, OTP serves",
+                we_dial(peer, identity.client(), otp_name, "ours"),
+            ),
+        ];
+        for (role, outcome) in cases {
+            failed |= !report_hybrid(role, otp_name, expected, outcome);
+        }
+    }
+    failed
+}
+
+/// One hybrid case's line, and the error under it when it failed.
+fn report_hybrid(
+    role: &str,
+    otp_name: &str,
+    expected: NamedGroup,
+    outcome: Result<NamedGroup, String>,
+) -> bool {
+    let pass = outcome == Ok(expected);
+    println!(
+        "{role:<22} OTP offers {otp_name:<26} {:<34} {}",
+        describe(&outcome),
+        if pass { "PASS" } else { "FAIL" }
+    );
+    report_detail(&outcome);
+    pass
+}
+
+/// The error under a failed line, or nothing.
+fn report_detail(outcome: &Result<NamedGroup, String>) {
+    if let Err(e) = outcome {
+        println!("{:<22} {e}", "");
+    }
+}
+
+/// No roots at all: key possession alone has to carry the handshake.
+fn key_possession(peer: &Peer) -> bool {
+    let (otp_name, expected) = HYBRIDS[0];
+    let possession = we_dial(peer, Identity::possession_client(), otp_name, "ours");
+    let pass = possession == Ok(expected);
+    println!(
+        "{:<22} {:<37} {:<34} {}",
+        "we dial, OTP serves",
+        "no roots: key possession alone",
+        describe(&possession),
+        if pass { "PASS" } else { "FAIL" }
+    );
+    report_detail(&possession);
+    pass
+}
+
+/// OTP checks our certificate's own signature.
+fn our_certificate(peer: &Peer) -> bool {
+    let certificate = peer.run(&["verify_cert"]);
+    println!(
+        "{:<22} {:<37} {:<34} {}",
+        "OTP checks",
+        "our certificate's own signature",
+        "",
+        if certificate.is_ok() { "PASS" } else { "FAIL" }
+    );
+    report_certificate(&certificate);
+    certificate.is_ok()
+}
+
+/// The error under a failed certificate check, or nothing.
+fn report_certificate(certificate: &Result<(), String>) {
+    if let Err(e) = certificate {
+        println!("{:<22} {e}", "");
+    }
+}
+
+/// A classical peer must be refused every way: key exchange, signatures,
+/// and an Ed25519 certificate. `true` when one was accepted.
+fn classical_controls(peer: &Peer, identity: &Identity) -> bool {
+    let cases = [
+        (
+            "OTP dials, we serve",
+            CLASSICAL_ONLY,
+            we_serve(peer, identity, CLASSICAL_ONLY, MLDSA87),
+        ),
+        (
+            "we dial, OTP serves",
+            CLASSICAL_ONLY,
+            we_dial(peer, identity.client(), CLASSICAL_ONLY, "ours"),
+        ),
+        (
+            "OTP dials, we serve",
+            "classical signatures only",
+            we_serve(peer, identity, HYBRIDS[0].0, CLASSICAL_SIGNATURES),
+        ),
+        (
+            "we dial, OTP serves",
+            "an Ed25519 certificate",
+            we_dial(peer, identity.client(), HYBRIDS[0].0, "classical"),
+        ),
+    ];
+    let mut failed = false;
+    for (role, offer, outcome) in cases {
+        failed |= !report_control(role, offer, outcome);
+    }
+    failed
+}
+
+/// One negative control's line: it must be refused. `true` when it was.
+fn report_control(role: &str, offer: &str, outcome: Result<NamedGroup, String>) -> bool {
+    let pass = outcome.is_err();
+    println!(
+        "{role:<22} OTP offers {offer:<26} {:<34} {}",
+        describe(&outcome),
+        if pass {
+            "PASS (refused, as required)"
+        } else {
+            "FAIL: a classical peer agreed"
+        }
+    );
+    report_detail(&outcome);
+    pass
 }
 
 fn describe(outcome: &Result<NamedGroup, String>) -> String {

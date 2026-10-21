@@ -27,7 +27,7 @@ use crate::poly::{
     add, centered_abs, from_signed, high_bits, low_bits, make_hint, multiply_add_ntt, ntt,
     ntt_inverse, power2round, sub, use_hint, Poly, N,
 };
-use crate::sample::{expand_a, expand_mask, expand_s, sample_in_ball, K_MAX, L_MAX};
+use crate::sample::{expand_a, expand_mask, expand_s, sample_in_ball, Matrix, K_MAX, L_MAX};
 use crate::{Error, ParameterSet, PrivateKey, D};
 
 /// FIPS 204 Algorithm 6, `ML-DSA.KeyGen_internal`.
@@ -358,9 +358,9 @@ fn hint_releasable(ct0_norm: i32, ones: usize, p: ParameterSet) -> bool {
 /// that can test verification's norm check.
 ///
 /// Every secret and every rejected attempt is wiped: the key's `K`, `s1`,
-/// `s2`, `t0` and their NTTs, `rho''`, and each iteration's `y`, `w`,
-/// `cs2`, `ct0` and `z`. A rejected `z` must never be released: it leaks
-/// the key.
+/// `s2`, `t0` and their NTTs, `rho''`, the transformed mask, and each
+/// attempt's whole working set ([`Attempt`], which includes `ct0`). A
+/// rejected `z` must never be released: it leaks the key.
 fn sign_given_mu(
     p: ParameterSet,
     sk: &[u8],
@@ -390,87 +390,167 @@ fn sign_given_mu(
     h.finalize_xof().read(&mut *rho_pp);
 
     let c_len = p.lambda / 4;
-    let mut y = Zeroizing::new([[0i32; N]; L_MAX]);
-    let mut y_hat = Zeroizing::new([[0i32; N]; L_MAX]);
-    let mut z = Zeroizing::new([[0i32; N]; L_MAX]);
-    let mut w = Zeroizing::new([[0i32; N]; K_MAX]);
-    let mut w1 = Zeroizing::new([[0i32; N]; K_MAX]);
-    let mut cs2 = Zeroizing::new([[0i32; N]; K_MAX]);
-    let mut r0 = Zeroizing::new([[0i32; N]; K_MAX]);
-    let mut ct0 = Zeroizing::new([[0i32; N]; K_MAX]);
-    let mut hint = Zeroizing::new([[0i32; N]; K_MAX]);
+    let mut round = Attempt::new();
     let mut kappa: u16 = 0;
     let mut attempts = 0u32;
     loop {
         attempts += 1;
-        expand_mask(&mut y, &rho_pp, kappa, p);
+        expand_mask(&mut round.y, &rho_pp, kappa, p);
         kappa = kappa.wrapping_add(p.l as u16);
 
-        // w = NTT^-1(A_hat o NTT(y)), w1 = HighBits(w).
-        *y_hat = *y;
-        for poly in y_hat.iter_mut().take(p.l) {
-            ntt(poly);
-        }
-        for r in 0..p.k {
-            w[r].fill(0);
-            for s in 0..p.l {
-                multiply_add_ntt(&mut w[r], &a_hat[r][s], &y_hat[s]);
-            }
-            ntt_inverse(&mut w[r]);
-            for i in 0..N {
-                w1[r][i] = high_bits(w[r][i], p.gamma2);
-            }
-        }
+        let (c_tilde, c_hat) = commitment(mu, &a_hat, p, &mut round);
 
-        // c~ = H(mu || w1Encode(w1), lambda / 4), c = SampleInBall(c~).
-        let mut c_tilde = [0u8; 64];
-        let mut h = Shake256::new();
-        h.update(mu);
-        w1_encode_into(&mut h, &w1, p);
-        h.finalize_xof().read(&mut c_tilde[..c_len]);
-        let mut c_hat = sample_in_ball(&c_tilde[..c_len], p.tau);
-        ntt(&mut c_hat);
-
-        // z = y + c s1, r0 = LowBits(w - c s2).
-        for s in 0..p.l {
-            let mut cs1 = [0i32; N];
-            multiply_add_ntt(&mut cs1, &c_hat, &s1[s]);
-            ntt_inverse(&mut cs1);
-            for i in 0..N {
-                z[s][i] = add(y[s][i], cs1[i]);
-            }
-            cs1.zeroize();
-        }
-        for r in 0..p.k {
-            cs2[r].fill(0);
-            multiply_add_ntt(&mut cs2[r], &c_hat, &s2[r]);
-            ntt_inverse(&mut cs2[r]);
-            for i in 0..N {
-                r0[r][i] = from_signed(low_bits(sub(w[r][i], cs2[r][i]), p.gamma2));
-            }
-        }
-        if !z_and_r0_releasable(norm(&z, p.l), norm(&r0, p.k), z_bound, p) {
+        z_and_r0(&c_hat, &s1, &s2, p, &mut round);
+        if !z_and_r0_releasable(norm(&round.z, p.l), norm(&round.r0, p.k), z_bound, p) {
             continue;
         }
 
-        // h = MakeHint(-c t0, w - c s2 + c t0).
-        let mut ones = 0;
-        for r in 0..p.k {
-            ct0[r].fill(0);
-            multiply_add_ntt(&mut ct0[r], &c_hat, &t0[r]);
-            ntt_inverse(&mut ct0[r]);
-            for i in 0..N {
-                let minus_ct0 = sub(0, ct0[r][i]);
-                let base = add(sub(w[r][i], cs2[r][i]), ct0[r][i]);
-                hint[r][i] = make_hint(minus_ct0, base, p.gamma2);
-                ones += hint[r][i] as usize;
-            }
-        }
-        if !hint_releasable(norm(&ct0, p.k), ones, p) {
+        let (ones, ct0_norm) = make_hints(&c_hat, &t0, p, &mut round);
+        if !hint_releasable(ct0_norm, ones, p) {
             continue;
         }
-        return (sig_encode(&c_tilde[..c_len], &z, &hint, p), attempts);
+        return (
+            sig_encode(&c_tilde[..c_len], &round.z, &round.hint, p),
+            attempts,
+        );
     }
+}
+
+/// One attempt's working set, in one place because every part of it is
+/// wiped when the attempt is dropped: `y` is the mask the secret depends
+/// on, and `z`, `r0` and the products are derived from it and the key.
+struct Attempt {
+    y: [[i32; N]; L_MAX],
+    z: [[i32; N]; L_MAX],
+    w: [[i32; N]; K_MAX],
+    w1: [[i32; N]; K_MAX],
+    cs2: [[i32; N]; K_MAX],
+    r0: [[i32; N]; K_MAX],
+    hint: [[i32; N]; K_MAX],
+}
+
+impl Attempt {
+    fn new() -> Self {
+        Self {
+            y: [[0i32; N]; L_MAX],
+            z: [[0i32; N]; L_MAX],
+            w: [[0i32; N]; K_MAX],
+            w1: [[0i32; N]; K_MAX],
+            cs2: [[0i32; N]; K_MAX],
+            r0: [[0i32; N]; K_MAX],
+            hint: [[0i32; N]; K_MAX],
+        }
+    }
+}
+
+/// The wipe is on `Drop` so that a `continue` between attempts and an
+/// early return wipe exactly alike.
+impl Drop for Attempt {
+    fn drop(&mut self) {
+        self.y.zeroize();
+        self.z.zeroize();
+        self.w.zeroize();
+        self.w1.zeroize();
+        self.cs2.zeroize();
+        self.r0.zeroize();
+        self.hint.zeroize();
+    }
+}
+
+/// `w = NTT^-1(A_hat o NTT(y))` and `w1 = HighBits(w)`, then the
+/// challenge `c~ = H(mu || w1Encode(w1), lambda / 4)` and
+/// `c = SampleInBall(c~)`, back in the NTT domain.
+fn commitment(
+    mu: &[u8; 64],
+    a_hat: &Matrix,
+    p: ParameterSet,
+    round: &mut Attempt,
+) -> (Zeroizing<[u8; 64]>, Poly) {
+    let mut y_hat = Zeroizing::new(round.y);
+    for poly in y_hat.iter_mut().take(p.l) {
+        ntt(poly);
+    }
+    for ((w_r, w1_r), a_row) in round
+        .w
+        .iter_mut()
+        .zip(round.w1.iter_mut())
+        .zip(a_hat.iter())
+        .take(p.k)
+    {
+        w_r.fill(0);
+        for (s, y_s) in y_hat.iter().enumerate().take(p.l) {
+            multiply_add_ntt(w_r, &a_row[s], y_s);
+        }
+        ntt_inverse(w_r);
+        for (one, w) in w1_r.iter_mut().zip(w_r.iter()) {
+            *one = high_bits(*w, p.gamma2);
+        }
+    }
+    let c_len = p.lambda / 4;
+    let mut c_tilde = Zeroizing::new([0u8; 64]);
+    let mut h = Shake256::new();
+    h.update(mu);
+    w1_encode_into(&mut h, &round.w1, p);
+    h.finalize_xof().read(&mut c_tilde[..c_len]);
+    let mut c_hat = sample_in_ball(&c_tilde[..c_len], p.tau);
+    ntt(&mut c_hat);
+    (c_tilde, c_hat)
+}
+
+/// `z = y + c s1` and `r0 = LowBits(w - c s2)`; `cs2` carries the second
+/// product out, for the hint.
+fn z_and_r0(
+    c_hat: &Poly,
+    s1: &[Poly; L_MAX],
+    s2: &[Poly; K_MAX],
+    p: ParameterSet,
+    round: &mut Attempt,
+) {
+    for (s, s1_s) in s1.iter().enumerate().take(p.l) {
+        let mut cs1 = [0i32; N];
+        multiply_add_ntt(&mut cs1, c_hat, s1_s);
+        ntt_inverse(&mut cs1);
+        for ((z_i, y_i), cs1_i) in round.z[s].iter_mut().zip(round.y[s]).zip(cs1) {
+            *z_i = add(y_i, cs1_i);
+        }
+        cs1.zeroize();
+    }
+    for (r, s2_r) in s2.iter().enumerate().take(p.k) {
+        round.cs2[r].fill(0);
+        multiply_add_ntt(&mut round.cs2[r], c_hat, s2_r);
+        ntt_inverse(&mut round.cs2[r]);
+        for ((r0_i, w_i), cs2_i) in round.r0[r].iter_mut().zip(round.w[r]).zip(round.cs2[r]) {
+            *r0_i = from_signed(low_bits(sub(w_i, cs2_i), p.gamma2));
+        }
+    }
+}
+
+/// `h = MakeHint(-c t0, w - c s2 + c t0)`, with the count of ones and the
+/// norm of `c t0` its caller's bounds are stated in.
+fn make_hints(
+    c_hat: &Poly,
+    t0: &[Poly; K_MAX],
+    p: ParameterSet,
+    round: &mut Attempt,
+) -> (usize, i32) {
+    let mut ct0 = Zeroizing::new([[0i32; N]; K_MAX]);
+    let mut ones = 0;
+    for (r, t0_r) in t0.iter().enumerate().take(p.k) {
+        ct0[r].fill(0);
+        multiply_add_ntt(&mut ct0[r], c_hat, t0_r);
+        ntt_inverse(&mut ct0[r]);
+        for ((hint_i, w_i), (cs2_i, ct0_i)) in round.hint[r]
+            .iter_mut()
+            .zip(round.w[r])
+            .zip(round.cs2[r].iter().zip(ct0[r].iter()))
+        {
+            let minus_ct0 = sub(0, *ct0_i);
+            let base = add(sub(w_i, *cs2_i), *ct0_i);
+            *hint_i = make_hint(minus_ct0, base, p.gamma2);
+            ones += *hint_i as usize;
+        }
+    }
+    (ones, norm(&ct0, p.k))
 }
 
 #[cfg(test)]
@@ -506,28 +586,36 @@ mod tests {
         let p = ML_DSA_65;
         let (pk, sk) = key_gen(p, &[3u8; 32]);
         let mut found = 0;
-        for i in 0u32..400 {
-            let message = i.to_le_bytes();
-            let mu = mu_of(&pk, &message);
-            let sig = sign_given_mu(p, &sk, &mu, &[0u8; 32], p.gamma1).0;
-            let s = sig_decode(&sig, p).expect("a well-formed signature");
-            if norm(&s.z, p.l) < p.gamma1 - p.beta() {
-                assert!(
-                    verify_mu_unchecked(p, &pk, &mu, &sig),
-                    "message {i}: control"
-                );
-                continue;
-            }
-            assert!(
-                !verify_mu_unchecked(p, &pk, &mu, &sig),
-                "message {i}: a z past gamma1 - beta was accepted"
-            );
-            found += 1;
-            if found == 3 {
-                return;
-            }
+        let mut i = 0u32;
+        while i < 400 && found < 3 {
+            found += z_past_the_bound(p, &pk, &sk, i);
+            i += 1;
         }
-        panic!("400 signatures gave only {found} with z past the bound: nothing was tested");
+        assert!(
+            found == 3,
+            "400 signatures gave only {found} with z past the bound: nothing was tested"
+        );
+    }
+
+    /// One message under the raised `z` bound: 1 when the real bound would
+    /// have rejected its signature, 0 when it is the positive control.
+    fn z_past_the_bound(p: ParameterSet, pk: &[u8], sk: &[u8], i: u32) -> usize {
+        let message = i.to_le_bytes();
+        let mu = mu_of(pk, &message);
+        let sig = sign_given_mu(p, sk, &mu, &[0u8; 32], p.gamma1).0;
+        let s = sig_decode(&sig, p).expect("a well-formed signature");
+        if norm(&s.z, p.l) < p.gamma1 - p.beta() {
+            assert!(
+                verify_mu_unchecked(p, pk, &mu, &sig),
+                "message {i}: control"
+            );
+            return 0;
+        }
+        assert!(
+            !verify_mu_unchecked(p, pk, &mu, &sig),
+            "message {i}: a z past gamma1 - beta was accepted"
+        );
+        1
     }
 
     /// Algorithm 8 with the length rule applied, for the tests above:
@@ -546,26 +634,36 @@ mod tests {
     fn verification_refuses_a_hint_count_running_backwards() {
         let p = ML_DSA_87;
         let (pk, sk) = key_gen(p, &[5u8; 32]);
-        let (omega, k) = (p.omega, p.k);
-        for i in 0u32..2000 {
-            let message = i.to_le_bytes();
-            let mu = mu_of(&pk, &message);
-            let sig = sign_given_mu(p, &sk, &mu, &[0u8; 32], p.gamma1 - p.beta()).0;
-            let y = sig.len() - (omega + k);
-            let count = |i: usize| sig[y + omega + i] as usize;
-            let Some(i) = (1..k).find(|&i| count(i) == count(i - 1) && count(i) > 0) else {
-                continue;
-            };
-            assert!(verify_mu_unchecked(p, &pk, &mu, &sig), "control");
-            let mut bad = sig.clone();
-            bad[y + omega + i] -= 1;
-            assert!(
-                !verify_mu_unchecked(p, &pk, &mu, &bad),
-                "a hint count running backwards was accepted"
-            );
-            return;
+        let mut i = 0;
+        while i < 2000 && !a_hint_count_backwards(p, &pk, &sk, i) {
+            i += 1;
         }
-        panic!("2000 signatures without a hint-free polynomial: nothing was tested");
+        assert!(
+            i < 2000,
+            "2000 signatures without a hint-free polynomial: nothing was tested"
+        );
+    }
+
+    /// One message: `true` when its signature had a polynomial to plant the
+    /// backward count on, and the refusal it earns has been checked.
+    fn a_hint_count_backwards(p: ParameterSet, pk: &[u8], sk: &[u8], i: u32) -> bool {
+        let (omega, k) = (p.omega, p.k);
+        let message = i.to_le_bytes();
+        let mu = mu_of(pk, &message);
+        let sig = sign_given_mu(p, sk, &mu, &[0u8; 32], p.gamma1 - p.beta()).0;
+        let y = sig.len() - (omega + k);
+        let count = |i: usize| sig[y + omega + i] as usize;
+        let Some(i) = (1..k).find(|&i| count(i) == count(i - 1) && count(i) > 0) else {
+            return false;
+        };
+        assert!(verify_mu_unchecked(p, pk, &mu, &sig), "control");
+        let mut bad = sig.clone();
+        bad[y + omega + i] -= 1;
+        assert!(
+            !verify_mu_unchecked(p, pk, &mu, &bad),
+            "a hint count running backwards was accepted"
+        );
+        true
     }
 
     /// Algorithm 7, line 23, at its boundaries in every parameter set:
@@ -573,19 +671,7 @@ mod tests {
     #[test]
     fn z_and_r0_are_released_only_below_their_bounds() {
         for p in [ML_DSA_44, ML_DSA_65, ML_DSA_87] {
-            let zb = p.gamma1 - p.beta();
-            let rb = p.gamma2 - p.beta();
-            assert!(z_and_r0_releasable(zb - 1, rb - 1, zb, p), "{}", p.name);
-            assert!(
-                !z_and_r0_releasable(zb, rb - 1, zb, p),
-                "{}: z at its bound",
-                p.name
-            );
-            assert!(
-                !z_and_r0_releasable(zb - 1, rb, zb, p),
-                "{}: r0 at its bound",
-                p.name
-            );
+            z_and_r0_bounds(p);
         }
     }
 
@@ -595,17 +681,39 @@ mod tests {
     #[test]
     fn a_hint_is_released_only_below_its_bounds() {
         for p in [ML_DSA_44, ML_DSA_65, ML_DSA_87] {
-            assert!(hint_releasable(p.gamma2 - 1, p.omega, p), "{}", p.name);
-            assert!(
-                !hint_releasable(p.gamma2, p.omega, p),
-                "{}: c t0 at gamma2",
-                p.name
-            );
-            assert!(
-                !hint_releasable(p.gamma2 - 1, p.omega + 1, p),
-                "{}: omega + 1 ones",
-                p.name
-            );
+            hint_bounds(p);
         }
+    }
+
+    /// One parameter set's `z` and `r0` boundaries.
+    fn z_and_r0_bounds(p: ParameterSet) {
+        let zb = p.gamma1 - p.beta();
+        let rb = p.gamma2 - p.beta();
+        assert!(z_and_r0_releasable(zb - 1, rb - 1, zb, p), "{}", p.name);
+        assert!(
+            !z_and_r0_releasable(zb, rb - 1, zb, p),
+            "{}: z at its bound",
+            p.name
+        );
+        assert!(
+            !z_and_r0_releasable(zb - 1, rb, zb, p),
+            "{}: r0 at its bound",
+            p.name
+        );
+    }
+
+    /// One parameter set's hint boundaries.
+    fn hint_bounds(p: ParameterSet) {
+        assert!(hint_releasable(p.gamma2 - 1, p.omega, p), "{}", p.name);
+        assert!(
+            !hint_releasable(p.gamma2, p.omega, p),
+            "{}: c t0 at gamma2",
+            p.name
+        );
+        assert!(
+            !hint_releasable(p.gamma2 - 1, p.omega + 1, p),
+            "{}: omega + 1 ones",
+            p.name
+        );
     }
 }

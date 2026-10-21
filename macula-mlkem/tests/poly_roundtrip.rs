@@ -38,6 +38,29 @@ fn reduce_lands_in_range() {
     }
 }
 
+/// Schoolbook negacyclic multiplication, written independently of the NTT
+/// so it can disagree with it. X^256 = -1, hence the subtraction when the
+/// degree wraps.
+fn schoolbook(a: &[i16; 256], b: &[i16; 256]) -> [i32; 256] {
+    let mut want = [0i32; 256];
+    for (i, &ai) in a.iter().enumerate() {
+        for (j, &bj) in b.iter().enumerate() {
+            add_term(&mut want, i + j, ai as i32 * bj as i32);
+        }
+    }
+    want
+}
+
+/// Add `v` at degree `k` of a schoolbook product, subtracting it from
+/// degree `k - 256` when the degree wraps.
+fn add_term(want: &mut [i32; 256], k: usize, v: i32) {
+    if k < 256 {
+        want[k] += v;
+        return;
+    }
+    want[k - 256] -= v;
+}
+
 /// Multiplication in the NTT domain must agree with schoolbook
 /// multiplication in `Z_q[X]/(X^256+1)`.
 #[test]
@@ -51,21 +74,7 @@ fn ntt_multiplication_agrees_with_schoolbook() {
             *y = lcg(&mut seed);
         }
         // schoolbook, negacyclic
-        // Schoolbook negacyclic multiplication, written independently of
-        // the NTT so it can disagree with it. X^256 = -1, hence the
-        // subtraction when the degree wraps.
-        let mut want = [0i32; 256];
-        for (i, &ai) in a.iter().enumerate() {
-            for (j, &bj) in b.iter().enumerate() {
-                let k = i + j;
-                let v = ai as i32 * bj as i32;
-                if k < 256 {
-                    want[k] += v;
-                } else {
-                    want[k - 256] -= v;
-                }
-            }
-        }
+        let want = schoolbook(&a, &b);
         let want: Vec<i16> = want.iter().map(|&v| (((v % Q) + Q) % Q) as i16).collect();
 
         let mut na = a;

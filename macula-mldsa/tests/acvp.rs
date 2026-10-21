@@ -401,6 +401,47 @@ fn key_gen_matches_acvp() {
     assert_eq!(ran, 75, "keyGen cases run");
 }
 
+/// One sigVer case, as the group it came from describes it.
+struct Case<'a> {
+    set: &'a str,
+    tc: u64,
+    ps: ParameterSet,
+    interface: &'a str,
+    external_mu: bool,
+    pk: &'a [u8],
+    t: &'a Value,
+}
+
+impl Case<'_> {
+    /// Verify one signature as the group's interface says to: the internal
+    /// function on `M'`, the same on an externally computed `mu`, or the
+    /// external function on a message and its context.
+    fn verify(&self, sig: &[u8]) -> bool {
+        let message = || hex(self.t["message"].as_str().unwrap());
+        match (self.interface, self.external_mu) {
+            ("internal", false) => {
+                macula_mldsa::internal::verify(self.ps, self.pk, &message(), sig)
+            }
+            ("internal", true) => {
+                let mu: [u8; 64] = hex(self.t["mu"].as_str().unwrap()).try_into().unwrap();
+                macula_mldsa::internal::verify_mu(self.ps, self.pk, &mu, sig)
+            }
+            ("external", _) => macula_mldsa::verify(
+                self.ps,
+                self.pk,
+                &message(),
+                sig,
+                &hex(self.t["context"].as_str().unwrap()),
+            )
+            .unwrap_or_else(|e| panic!("{} tcId {}: verify refused ({e:?})", self.set, self.tc)),
+            (other, _) => panic!(
+                "{} tcId {}: an interface this test does not know: {other:?}",
+                self.set, self.tc
+            ),
+        }
+    }
+}
+
 /// FIPS 204 Algorithms 3 and 8, `ML-DSA.Verify` and `Verify_internal`,
 /// on every pure sigVer case, dispatched by NIST's interface: the internal
 /// function on `M'`, the same with an externally computed `mu`, and the
@@ -419,43 +460,7 @@ fn sig_ver_matches_acvp_every_negative_by_its_reason() {
     let (run, _) = pure_groups(&p);
     let mut agreed: BTreeMap<String, usize> = BTreeMap::new();
     for g in run {
-        let set = g["parameterSet"].as_str().unwrap();
-        let ps = param(set);
-        let interface = g["signatureInterface"].as_str().unwrap();
-        let external_mu = g.get("externalMu").and_then(Value::as_bool) == Some(true);
-        for t in tests(g) {
-            let tc = t["tcId"].as_u64().unwrap();
-            let reason = reasons[&tc].as_str();
-            let pk = hex(t["pk"].as_str().unwrap());
-            let sig = hex(t["signature"].as_str().unwrap());
-            let got = match (interface, external_mu) {
-                ("internal", false) => macula_mldsa::internal::verify(
-                    ps,
-                    &pk,
-                    &hex(t["message"].as_str().unwrap()),
-                    &sig,
-                ),
-                ("internal", true) => {
-                    let mu: [u8; 64] = hex(t["mu"].as_str().unwrap()).try_into().unwrap();
-                    macula_mldsa::internal::verify_mu(ps, &pk, &mu, &sig)
-                }
-                ("external", _) => macula_mldsa::verify(
-                    ps,
-                    &pk,
-                    &hex(t["message"].as_str().unwrap()),
-                    &sig,
-                    &hex(t["context"].as_str().unwrap()),
-                )
-                .unwrap_or_else(|e| panic!("{set} tcId {tc}: verify refused ({e:?})")),
-                other => panic!("{set} tcId {tc}: an interface this test does not know: {other:?}"),
-            };
-            let want = exp[&tc]["testPassed"].as_bool().unwrap();
-            assert_eq!(
-                got, want,
-                "{set} tcId {tc} [{reason}], {interface} interface: verify said {got}, NIST says {want}"
-            );
-            *agreed.entry(reason.to_string()).or_default() += 1;
-        }
+        sig_ver_group(g, &exp, &reasons, &mut agreed);
     }
     let want: BTreeMap<String, usize> = [
         MODIFIED_MESSAGE,
@@ -468,6 +473,42 @@ fn sig_ver_matches_acvp_every_negative_by_its_reason() {
     .map(|r| (r.to_string(), 27))
     .collect();
     assert_eq!(agreed, want, "verify agreed with NIST, by reason");
+}
+
+/// One group of the sigVer prompt: every case verified, its outcome counted
+/// under NIST's reason label.
+fn sig_ver_group(
+    g: &Value,
+    exp: &BTreeMap<u64, Value>,
+    reasons: &BTreeMap<u64, String>,
+    agreed: &mut BTreeMap<String, usize>,
+) {
+    let set = g["parameterSet"].as_str().unwrap();
+    let ps = param(set);
+    let interface = g["signatureInterface"].as_str().unwrap();
+    let external_mu = g.get("externalMu").and_then(Value::as_bool) == Some(true);
+    for t in tests(g) {
+        let tc = t["tcId"].as_u64().unwrap();
+        let reason = reasons[&tc].as_str();
+        let pk = hex(t["pk"].as_str().unwrap());
+        let sig = hex(t["signature"].as_str().unwrap());
+        let case = Case {
+            set,
+            tc,
+            ps,
+            interface,
+            external_mu,
+            pk: &pk,
+            t,
+        };
+        let got = case.verify(&sig);
+        let want = exp[&tc]["testPassed"].as_bool().unwrap();
+        assert_eq!(
+            got, want,
+            "{set} tcId {tc} [{reason}], {interface} interface: verify said {got}, NIST says {want}"
+        );
+        *agreed.entry(reason.to_string()).or_default() += 1;
+    }
 }
 
 /// ⛔ HINT REFUSALS NIST'S VECTORS NEVER REACH. Its "modified hint" cases
@@ -492,76 +533,102 @@ fn malformed_hints_are_refused_even_when_they_decode_to_the_valid_hint() {
     let exp = expected(SIGVER);
     let p = vectors(SIGVER, "prompt.json");
     let (run, _) = pure_groups(&p);
-    let mut broken: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    let mut broken: BTreeMap<(String, String), usize> = BTreeMap::new();
     for g in run {
-        let set = g["parameterSet"].as_str().unwrap();
-        let ps = param(set);
-        let interface = g["signatureInterface"].as_str().unwrap();
-        let external_mu = g.get("externalMu").and_then(Value::as_bool) == Some(true);
-        for t in tests(g) {
-            let tc = t["tcId"].as_u64().unwrap();
-            if exp[&tc]["testPassed"] != true {
-                continue;
-            }
-            let pk = hex(t["pk"].as_str().unwrap());
-            let verify = |sig: &[u8]| match (interface, external_mu) {
-                ("internal", false) => macula_mldsa::internal::verify(
-                    ps,
-                    &pk,
-                    &hex(t["message"].as_str().unwrap()),
-                    sig,
-                ),
-                ("internal", true) => {
-                    let mu: [u8; 64] = hex(t["mu"].as_str().unwrap()).try_into().unwrap();
-                    macula_mldsa::internal::verify_mu(ps, &pk, &mu, sig)
-                }
-                _ => macula_mldsa::verify(
-                    ps,
-                    &pk,
-                    &hex(t["message"].as_str().unwrap()),
-                    sig,
-                    &hex(t["context"].as_str().unwrap()),
-                )
-                .unwrap(),
-            };
-            let sig = hex(t["signature"].as_str().unwrap());
-            assert!(verify(&sig), "{set} tcId {tc}: control");
-            let (omega, k) = (ps.omega, ps.k);
-            let y = sig.len() - (omega + k);
-            let count = |s: &[u8], i: usize| s[y + omega + i] as usize;
-
-            // Nonzero padding after the last hint position.
-            let total = count(&sig, k - 1);
-            if total < omega {
-                let mut bad = sig.clone();
-                bad[y + total] = 1;
-                assert!(!verify(&bad), "{set} tcId {tc}: nonzero padding accepted");
-                *broken.entry((set, "nonzero padding")).or_default() += 1;
-            }
-            // Counts past omega, over positions that keep rising into the
-            // count bytes themselves, so the ordering rule never objects:
-            // polynomial 0 takes positions 0..omega, polynomial i claims to
-            // end at omega + i. Without the omega check, decoding reads
-            // past the hint's first omega bytes and indexes out of range.
-            let mut bad = sig.clone();
-            for j in 0..omega {
-                bad[y + j] = j as u8;
-            }
-            for i in 0..k {
-                bad[y + omega + i] = (omega + i) as u8;
-            }
-            assert!(!verify(&bad), "{set} tcId {tc}: counts past omega accepted");
-            *broken.entry((set, "count past omega")).or_default() += 1;
-        }
+        break_one_group(g, &exp, &mut broken);
     }
     for set in ["ML-DSA-44", "ML-DSA-65", "ML-DSA-87"] {
         for fault in ["nonzero padding", "count past omega"] {
+            let seen = broken.get(&(set.to_string(), fault.to_string()));
             assert!(
-                broken.get(&(set, fault)).is_some_and(|&n| n > 0),
+                seen.is_some_and(|&n| n > 0),
                 "{set}: no valid signature could carry the fault `{fault}`, so it went untested"
             );
         }
     }
+}
+
+/// One group's valid signatures, each broken in the two ways NIST's own
+/// vectors never reach, and counted by fault name.
+fn break_one_group(
+    g: &Value,
+    exp: &BTreeMap<u64, Value>,
+    broken: &mut BTreeMap<(String, String), usize>,
+) {
+    let set = g["parameterSet"].as_str().unwrap();
+    let ps = param(set);
+    let interface = g["signatureInterface"].as_str().unwrap();
+    let external_mu = g.get("externalMu").and_then(Value::as_bool) == Some(true);
+    for t in tests(g) {
+        let tc = t["tcId"].as_u64().unwrap();
+        if exp[&tc]["testPassed"] != true {
+            continue;
+        }
+        let pk = hex(t["pk"].as_str().unwrap());
+        let case = Case {
+            set,
+            tc,
+            ps,
+            interface,
+            external_mu,
+            pk: &pk,
+            t,
+        };
+        let sig = hex(t["signature"].as_str().unwrap());
+        assert!(case.verify(&sig), "{set} tcId {tc}: control");
+        if plant_nonzero_padding(&case, &sig, ps) {
+            *broken
+                .entry((set.to_string(), "nonzero padding".to_string()))
+                .or_default() += 1;
+        }
+        plant_count_past_omega(&case, &sig, ps);
+        *broken
+            .entry((set.to_string(), "count past omega".to_string()))
+            .or_default() += 1;
+    }
+}
+
+/// Nonzero padding after the last hint position: `false` when this
+/// signature leaves no room for it, which the caller's counts check.
+fn plant_nonzero_padding(case: &Case<'_>, sig: &[u8], ps: ParameterSet) -> bool {
+    let (omega, k) = (ps.omega, ps.k);
+    let y = sig.len() - (omega + k);
+    let total = sig[y + omega + k - 1] as usize;
+    if total >= omega {
+        return false;
+    }
+    let mut bad = sig.to_vec();
+    bad[y + total] = 1;
+    assert!(
+        !case.verify(&bad),
+        "{} tcId {}: nonzero padding accepted",
+        case.set,
+        case.tc
+    );
+    true
+}
+
+/// Counts past omega, over positions that keep rising into the count bytes
+/// themselves, so the ordering rule never objects: polynomial 0 takes
+/// positions 0..omega, polynomial i claims to end at omega + i. Without the
+/// omega check, decoding reads past the hint's first omega bytes and
+/// indexes out of range.
+fn plant_count_past_omega(case: &Case<'_>, sig: &[u8], ps: ParameterSet) {
+    let (omega, k) = (ps.omega, ps.k);
+    let y = sig.len() - (omega + k);
+    let mut bad = sig.to_vec();
+    for (j, byte) in bad[y..y + omega].iter_mut().enumerate() {
+        *byte = j as u8;
+    }
+    for (i, byte) in bad[y + omega..y + omega + k].iter_mut().enumerate() {
+        *byte = (omega + i) as u8;
+    }
+    assert!(
+        !case.verify(&bad),
+        "{} tcId {}: counts past omega accepted",
+        case.set,
+        case.tc
+    );
 }
 
 /// Signs one sigGen or sigGen-tr1 case the way its group says: the

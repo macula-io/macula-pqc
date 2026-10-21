@@ -215,6 +215,21 @@ fn attempts(p: ParameterSet, sk: &[u8], mu: &[u8; 64], rnd: &[u8; 32]) -> u32 {
         .1
 }
 
+/// The positive control: sign, then branch on the secret bytes.
+fn sign_and_branch<const SK: usize>(p: ParameterSet, mu: &[u8; 64], rnd: &[u8; 32], sk: &[u8; SK]) {
+    black_box(
+        sign_mu_counting_attempts(p, PrivateKey::Expanded(black_box(&sk[..])), mu, rnd).unwrap(),
+    );
+    let secret_bytes = 32 * (p.l + p.k) * if p.eta == 2 { 3 } else { 4 };
+    let mut taken = 0u32;
+    for &b in black_box(&sk[128..128 + secret_bytes]) {
+        if b < 8 {
+            taken = black_box(taken + 1);
+        }
+    }
+    black_box(taken);
+}
+
 /// Every test for one parameter set. `SK` is its private key length: the
 /// inputs are fixed-size arrays so they can be staged.
 fn time_set<const SK: usize>(p: ParameterSet, n: usize, rng: &mut Prng) -> Outcome {
@@ -254,17 +269,7 @@ fn time_set<const SK: usize>(p: ParameterSet, n: usize, rng: &mut Prng) -> Outco
         );
     };
 
-    let secret_bytes = 32 * (p.l + p.k) * if p.eta == 2 { 3 } else { 4 };
-    let pairs = measure(n, rng, sk_a, &pool, |sk| {
-        sign_one(sk);
-        let mut taken = 0u32;
-        for &b in black_box(&sk[128..128 + secret_bytes]) {
-            if b < 8 {
-                taken = black_box(taken + 1);
-            }
-        }
-        black_box(taken);
-    });
+    let pairs = measure(n, rng, sk_a, &pool, |sk| sign_and_branch(p, &mu, &rnd, sk));
     let control = report("CONTROL sign + branch on secret bytes (must be)", &pairs);
 
     let same: [u8; SK] = (*key_gen(p, &seed_a).1).clone().try_into().unwrap();

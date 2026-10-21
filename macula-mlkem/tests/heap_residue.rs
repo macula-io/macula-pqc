@@ -34,6 +34,25 @@ static NEEDLES: OnceLock<Vec<(String, Vec<u8>)>> = OnceLock::new();
 const MAX_NEEDLES: usize = 1024;
 static HITS: [AtomicBool; MAX_NEEDLES] = [const { AtomicBool::new(false) }; MAX_NEEDLES];
 
+/// Look for each planted needle in a block that is being freed.
+///
+/// # Safety
+///
+/// `ptr` must be a live allocation of at least `size` zeroed bytes.
+unsafe fn scan_for_needles(ptr: *const u8, size: usize) {
+    let Some(needles) = NEEDLES.get() else {
+        return;
+    };
+    // SAFETY: the caller promises a live allocation of `size` bytes,
+    // and it was zeroed when it was handed out.
+    let block = unsafe { std::slice::from_raw_parts(ptr, size) };
+    for (i, (_, needle)) in needles.iter().enumerate() {
+        if block.windows(needle.len()).any(|w| w == needle.as_slice()) {
+            HITS[i].store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 struct Scanning;
 
 unsafe impl GlobalAlloc for Scanning {
@@ -44,16 +63,9 @@ unsafe impl GlobalAlloc for Scanning {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if SCANNING.load(Ordering::SeqCst) {
-            if let Some(needles) = NEEDLES.get() {
-                // SAFETY: the block is still allocated, `layout.size()`
-                // bytes long, and was zeroed when it was handed out.
-                let block = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
-                for (i, (_, needle)) in needles.iter().enumerate() {
-                    if block.windows(needle.len()).any(|w| w == needle.as_slice()) {
-                        HITS[i].store(true, Ordering::SeqCst);
-                    }
-                }
-            }
+            // SAFETY: the block is still allocated, `layout.size()` bytes
+            // long, and was zeroed when it was handed out.
+            unsafe { scan_for_needles(ptr, layout.size()) };
         }
         // SAFETY: forwarded unchanged to the system allocator.
         unsafe { System.dealloc(ptr, layout) }
@@ -100,7 +112,6 @@ struct Run {
 impl Run {
     fn new(p: ParameterSet, needles: &mut Vec<(String, Vec<u8>)>) -> Run {
         let name = p.name;
-        let k = p.k;
         let d = seed(&format!("{name} d"));
         let z = seed(&format!("{name} z"));
         let m = seed(&format!("{name} m"));
@@ -114,62 +125,9 @@ impl Run {
         add("d".into(), &d);
         add("z".into(), &z);
         add("m".into(), &m);
-
-        // Key generation: (rho, sigma) = G(d || k); s from PRF counters
-        // 0..k, e from k..2k, both taken to the NTT domain.
-        let mut dk_seed = d.to_vec();
-        dk_seed.push(k as u8);
-        let (_, sigma) = g(&dk_seed);
-        add("sigma".into(), &sigma);
-        for i in 0..2 * k {
-            let bytes = prf(p.eta1, &sigma, i as u8).to_vec();
-            add(format!("prf(sigma, {i})"), &bytes);
-            let mut f = sample_poly_cbd(p.eta1, &bytes);
-            ntt(&mut f);
-            let which = if i < k { "s_hat" } else { "e_hat" };
-            add(format!("{which}[{}]", i % k), &poly_bytes(&f));
-        }
-        for (i, window) in dk[..384 * k].as_chunks::<32>().0.iter().enumerate() {
-            add(format!("dk_pke bytes {}..{}", 32 * i, 32 * i + 32), window);
-        }
-
-        // Encapsulation: (K, r) = G(m || H(ek)); y from PRF counters
-        // 0..k (NTT domain), e1 from k..2k, e2 from 2k.
-        let mut encaps_seed = m.to_vec();
-        encaps_seed.extend_from_slice(&sha3_256(&ek));
-        let (big_k, r) = g(&encaps_seed);
-        assert_eq!(
-            big_k.as_slice(),
-            &shared[..],
-            "{name}: K worked out independently"
-        );
-        add("K".into(), &big_k);
-        add("r".into(), &r);
-        for i in 0..=2 * k {
-            let eta = if i < k { p.eta1 } else { p.eta2 };
-            let bytes = prf(eta, &r, i as u8).to_vec();
-            add(format!("prf(r, {i})"), &bytes);
-            let mut f = sample_poly_cbd(eta, &bytes);
-            let which = match i {
-                i if i < k => {
-                    ntt(&mut f);
-                    format!("y_hat[{i}]")
-                }
-                i if i < 2 * k => format!("e1[{}]", i - k),
-                _ => "e2".to_string(),
-            };
-            add(which, &poly_bytes(&f));
-        }
-
-        // Decapsulation: the implicit-rejection secret J(z || c), for the
-        // valid ciphertext and for the modified one.
-        for (what, cipher) in [("K_bar(valid c)", &c), ("K_bar(modified c)", &c_modified)] {
-            let mut input = z.to_vec();
-            input.extend_from_slice(cipher);
-            let mut k_bar = [0u8; 32];
-            shake256(&input, &mut k_bar);
-            add(what.into(), &k_bar);
-        }
+        add_key_gen_secrets(&mut add, p, &d, &dk);
+        add_encapsulation_secrets(&mut add, p, &m, &ek, &shared[..]);
+        add_rejection_secrets(&mut add, &z, &c, &c_modified);
 
         Run {
             p,
@@ -189,6 +147,112 @@ impl Run {
         drop(internal::encaps(self.p, &self.ek, &self.m));
         drop(decaps(self.p, &self.dk, &self.c));
         drop(decaps(self.p, &self.dk, &self.c_modified));
+    }
+}
+
+/// Key generation: (rho, sigma) = G(d || k); s from PRF counters
+/// 0..k, e from k..2k, both taken to the NTT domain.
+fn add_key_gen_secrets(
+    add: &mut impl FnMut(String, &[u8]),
+    p: ParameterSet,
+    d: &[u8; 32],
+    dk: &[u8],
+) {
+    let k = p.k;
+    let mut dk_seed = d.to_vec();
+    dk_seed.push(k as u8);
+    let (_, sigma) = g(&dk_seed);
+    add("sigma".into(), &sigma);
+    for i in 0..2 * k {
+        let bytes = prf(p.eta1, &sigma, i as u8).to_vec();
+        add(format!("prf(sigma, {i})"), &bytes);
+        let mut f = sample_poly_cbd(p.eta1, &bytes);
+        ntt(&mut f);
+        let which = key_gen_secret(i, k);
+        add(format!("{which}[{}]", i % k), &poly_bytes(&f));
+    }
+    for (i, window) in dk[..384 * k].as_chunks::<32>().0.iter().enumerate() {
+        add(format!("dk_pke bytes {}..{}", 32 * i, 32 * i + 32), window);
+    }
+}
+
+/// The name of the key-generation polynomial PRF counter `i` produces.
+fn key_gen_secret(i: usize, k: usize) -> &'static str {
+    if i < k {
+        "s_hat"
+    } else {
+        "e_hat"
+    }
+}
+
+/// Encapsulation: (K, r) = G(m || H(ek)); y from PRF counters
+/// 0..k (NTT domain), e1 from k..2k, e2 from 2k.
+fn add_encapsulation_secrets(
+    add: &mut impl FnMut(String, &[u8]),
+    p: ParameterSet,
+    m: &[u8; 32],
+    ek: &[u8],
+    shared: &[u8],
+) {
+    let k = p.k;
+    let mut encaps_seed = m.to_vec();
+    encaps_seed.extend_from_slice(&sha3_256(ek));
+    let (big_k, r) = g(&encaps_seed);
+    assert_eq!(
+        big_k.as_slice(),
+        shared,
+        "{}: K worked out independently",
+        p.name
+    );
+    add("K".into(), &big_k);
+    add("r".into(), &r);
+    for i in 0..=2 * k {
+        let eta = encaps_eta(p, i, k);
+        let bytes = prf(eta, &r, i as u8).to_vec();
+        add(format!("prf(r, {i})"), &bytes);
+        let mut f = sample_poly_cbd(eta, &bytes);
+        let which = encaps_secret(&mut f, i, k);
+        add(which, &poly_bytes(&f));
+    }
+}
+
+/// The CBD width of encapsulation polynomial `i`: `eta1` for the `y`
+/// counters, `eta2` for `e1` and `e2`.
+fn encaps_eta(p: ParameterSet, i: usize, k: usize) -> usize {
+    if i < k {
+        p.eta1
+    } else {
+        p.eta2
+    }
+}
+
+/// The name of encapsulation polynomial `i`, moving the `y` counters to
+/// the NTT domain on the way.
+fn encaps_secret(f: &mut Poly, i: usize, k: usize) -> String {
+    if i < k {
+        ntt(f);
+        return format!("y_hat[{i}]");
+    }
+    if i < 2 * k {
+        return format!("e1[{}]", i - k);
+    }
+    "e2".to_string()
+}
+
+/// Decapsulation: the implicit-rejection secret J(z || c), for the valid
+/// ciphertext and for the modified one.
+fn add_rejection_secrets(
+    add: &mut impl FnMut(String, &[u8]),
+    z: &[u8; 32],
+    c: &[u8],
+    c_modified: &[u8],
+) {
+    for (what, cipher) in [("K_bar(valid c)", c), ("K_bar(modified c)", c_modified)] {
+        let mut input = z.to_vec();
+        input.extend_from_slice(cipher);
+        let mut k_bar = [0u8; 32];
+        shake256(&input, &mut k_bar);
+        add(what.into(), &k_bar);
     }
 }
 

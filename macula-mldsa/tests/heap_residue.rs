@@ -36,6 +36,24 @@ static NEEDLES: OnceLock<Vec<(String, Vec<u8>)>> = OnceLock::new();
 const MAX_NEEDLES: usize = 1024;
 static HITS: [AtomicBool; MAX_NEEDLES] = [const { AtomicBool::new(false) }; MAX_NEEDLES];
 
+/// Look for each planted needle in a block that is being freed.
+///
+/// # Safety
+///
+/// `ptr` must be a live allocation of at least `size` zeroed bytes.
+unsafe fn scan_for_needles(ptr: *const u8, size: usize) {
+    let Some(needles) = NEEDLES.get() else {
+        return;
+    };
+    // SAFETY: the caller promises a live allocation of `size` bytes.
+    let block = unsafe { std::slice::from_raw_parts(ptr, size) };
+    for (i, (_, needle)) in needles.iter().enumerate() {
+        if block.windows(needle.len()).any(|w| w == needle.as_slice()) {
+            HITS[i].store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 struct Scanning;
 
 unsafe impl GlobalAlloc for Scanning {
@@ -46,16 +64,9 @@ unsafe impl GlobalAlloc for Scanning {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if SCANNING.load(Ordering::SeqCst) {
-            if let Some(needles) = NEEDLES.get() {
-                // SAFETY: the block is still allocated, `layout.size()`
-                // bytes long, and was zeroed when it was handed out.
-                let block = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
-                for (i, (_, needle)) in needles.iter().enumerate() {
-                    if block.windows(needle.len()).any(|w| w == needle.as_slice()) {
-                        HITS[i].store(true, Ordering::SeqCst);
-                    }
-                }
-            }
+            // SAFETY: the block is still allocated, `layout.size()` bytes
+            // long, and was zeroed when it was handed out.
+            unsafe { scan_for_needles(ptr, layout.size()) };
         }
         // SAFETY: forwarded unchanged to the system allocator.
         unsafe { System.dealloc(ptr, layout) }

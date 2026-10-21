@@ -87,6 +87,13 @@ fn expected(dir: &str) -> BTreeMap<u64, Value> {
     out
 }
 
+/// One test's `reason`, when the projection carries one.
+fn add_reason(out: &mut BTreeMap<u64, String>, t: &Value) {
+    if let Some(r) = t.get("reason").and_then(|v| v.as_str()) {
+        out.insert(t["tcId"].as_u64().unwrap(), r.to_string());
+    }
+}
+
 /// The `reason` labels live ONLY in internalProjection, not in prompt or
 /// expectedResults. A harness built from the other two gets the rejection
 /// cases but cannot tell which they are, and would not notice them all
@@ -96,12 +103,18 @@ fn reasons(dir: &str) -> BTreeMap<u64, String> {
     let mut out = BTreeMap::new();
     for g in p["testGroups"].as_array().unwrap() {
         for t in g["tests"].as_array().unwrap() {
-            if let Some(r) = t.get("reason").and_then(|v| v.as_str()) {
-                out.insert(t["tcId"].as_u64().unwrap(), r.to_string());
-            }
+            add_reason(&mut out, t);
         }
     }
     out
+}
+
+/// Whether a test's vector labels it an implicit-rejection case.
+fn is_modified_ciphertext(reasons: &BTreeMap<u64, String>, t: &Value) -> bool {
+    reasons
+        .get(&t["tcId"].as_u64().unwrap())
+        .map(String::as_str)
+        == Some("modified ciphertext")
 }
 
 // ---------------------------------------------------------------------
@@ -127,6 +140,22 @@ fn keygen_vector_file_has_the_expected_shape() {
     }
 }
 
+/// ⛔ Exactly half the decapsulation cases must be implicit-rejection
+/// cases. If a later vector file has fewer, this fails rather than the
+/// suite quietly testing the rejection path less.
+fn assert_decapsulation_shape(set: &str, tests: &[Value], reasons: &BTreeMap<u64, String>) {
+    assert_eq!(tests.len(), 10, "{set} decapsulation VAL count");
+    let modified = tests
+        .iter()
+        .filter(|t| is_modified_ciphertext(reasons, t))
+        .count();
+    assert_eq!(
+        modified, 5,
+        "{set}: expected exactly 5 of 10 decapsulation cases to carry \
+         reason \"modified ciphertext\""
+    );
+}
+
 #[test]
 fn encap_decap_vector_file_has_the_expected_shape() {
     let p = vectors(ENCAP_DECAP, "prompt.json");
@@ -141,26 +170,7 @@ fn encap_decap_vector_file_has_the_expected_shape() {
 
         match function {
             "encapsulation" => assert_eq!(tests.len(), 25, "{set} encapsulation AFT count"),
-            "decapsulation" => {
-                assert_eq!(tests.len(), 10, "{set} decapsulation VAL count");
-                // ⛔ Exactly half must be implicit-rejection cases. If a
-                // later vector file has fewer, this fails rather than the
-                // suite quietly testing the rejection path less.
-                let modified = tests
-                    .iter()
-                    .filter(|t| {
-                        reasons
-                            .get(&t["tcId"].as_u64().unwrap())
-                            .map(String::as_str)
-                            == Some("modified ciphertext")
-                    })
-                    .count();
-                assert_eq!(
-                    modified, 5,
-                    "{set}: expected exactly 5 of 10 decapsulation cases to carry \
-                     reason \"modified ciphertext\""
-                );
-            }
+            "decapsulation" => assert_decapsulation_shape(set, tests, &reasons),
             "encapsulationKeyCheck" | "decapsulationKeyCheck" => {
                 assert_eq!(tests.len(), 10, "{set} {function} count")
             }
@@ -314,6 +324,36 @@ fn encaps_matches_acvp() {
     }
 }
 
+/// One decapsulation case: assert its shared secret against the expected
+/// `k`, and return 1 when the vector labels it an implicit rejection.
+fn check_decaps_case(
+    set: &str,
+    exp: &BTreeMap<u64, Value>,
+    reasons: &BTreeMap<u64, String>,
+    t: &Value,
+) -> usize {
+    let tc = t["tcId"].as_u64().unwrap();
+    let dk = hex(t["dk"].as_str().unwrap());
+    let c = hex(t["c"].as_str().unwrap());
+    let reason = reasons.get(&tc).map(String::as_str).unwrap_or("unlabelled");
+    let k = macula_mlkem::decaps(param(set), &dk, &c).unwrap_or_else(|e| {
+        panic!(
+            "{set} tcId {tc} ({reason}): decapsulation returned an ERROR ({e:?}). \
+             FIPS 203 returns a pseudorandom secret on a modified ciphertext, \
+             never an error."
+        )
+    });
+    let want = &exp[&tc];
+    compare(
+        set,
+        tc,
+        &format!("shared secret [{reason}]"),
+        &k[..],
+        &hex(want["k"].as_str().unwrap()),
+    );
+    usize::from(reason == "modified ciphertext")
+}
+
 /// ⛔ THE IMPLICIT-REJECTION CASES ARE ASSERTED AGAINST THE EXPECTED `k`,
 /// BY LABEL, not by "decapsulation failed". FIPS 203 returns a
 /// deterministic pseudorandom secret for a modified ciphertext, so an
@@ -332,34 +372,21 @@ fn decaps_matches_acvp_including_implicit_rejection() {
         }
         let set = g["parameterSet"].as_str().unwrap();
         for t in g["tests"].as_array().unwrap() {
-            let tc = t["tcId"].as_u64().unwrap();
-            let dk = hex(t["dk"].as_str().unwrap());
-            let c = hex(t["c"].as_str().unwrap());
-            let reason = reasons.get(&tc).map(String::as_str).unwrap_or("unlabelled");
-            if reason == "modified ciphertext" {
-                rejections += 1;
-            }
-            let k = macula_mlkem::decaps(param(set), &dk, &c).unwrap_or_else(|e| {
-                panic!(
-                    "{set} tcId {tc} ({reason}): decapsulation returned an ERROR ({e:?}). \
-                     FIPS 203 returns a pseudorandom secret on a modified ciphertext, \
-                     never an error."
-                )
-            });
-            let want = &exp[&tc];
-            compare(
-                set,
-                tc,
-                &format!("shared secret [{reason}]"),
-                &k[..],
-                &hex(want["k"].as_str().unwrap()),
-            );
+            rejections += check_decaps_case(set, &exp, &reasons, t);
         }
     }
     assert_eq!(
         rejections, 15,
         "5 implicit-rejection cases per parameter set, 3 sets"
     );
+}
+
+/// The key check the vector's `function` names, on the key it carries.
+fn key_check(function: &str, set: &str, t: &Value) -> bool {
+    if function == "encapsulationKeyCheck" {
+        return macula_mlkem::encaps_key_valid(param(set), &hex(t["ek"].as_str().unwrap()));
+    }
+    macula_mlkem::decaps_key_valid(param(set), &hex(t["dk"].as_str().unwrap()))
 }
 
 #[test]
@@ -375,11 +402,7 @@ fn key_checks_match_acvp() {
         for t in g["tests"].as_array().unwrap() {
             let tc = t["tcId"].as_u64().unwrap();
             let want = exp[&tc]["testPassed"].as_bool().unwrap();
-            let got = if function == "encapsulationKeyCheck" {
-                macula_mlkem::encaps_key_valid(param(set), &hex(t["ek"].as_str().unwrap()))
-            } else {
-                macula_mlkem::decaps_key_valid(param(set), &hex(t["dk"].as_str().unwrap()))
-            };
+            let got = key_check(function, set, t);
             assert_eq!(got, want, "{set} tcId {tc} {function}");
         }
     }

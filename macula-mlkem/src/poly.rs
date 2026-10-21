@@ -65,28 +65,36 @@ const fn build_zetas() -> [i16; 128] {
     let mut out = [0i16; 128];
     let mut i = 0;
     while i < 128 {
-        // BitRev7
-        let mut r = 0usize;
-        let mut b = 0;
-        while b < 7 {
-            r |= ((i >> b) & 1) << (6 - b);
-            b += 1;
-        }
-        // 17^r mod q by square and multiply
-        let mut acc: i32 = 1;
-        let mut base: i32 = 17;
-        let mut e = r;
-        while e > 0 {
-            if e & 1 == 1 {
-                acc = (acc * base) % Q;
-            }
-            base = (base * base) % Q;
-            e >>= 1;
-        }
-        out[i] = acc as i16;
+        out[i] = pow17(bit_rev7(i)) as i16;
         i += 1;
     }
     out
+}
+
+/// The seven-bit reversal of `i`, FIPS 203 Algorithm 9's BitRev7.
+const fn bit_rev7(i: usize) -> usize {
+    let mut r = 0usize;
+    let mut b = 0;
+    while b < 7 {
+        r |= ((i >> b) & 1) << (6 - b);
+        b += 1;
+    }
+    r
+}
+
+/// `17^r mod q` by square and multiply.
+const fn pow17(r: usize) -> i32 {
+    let mut acc: i32 = 1;
+    let mut base: i32 = 17;
+    let mut e = r;
+    while e > 0 {
+        if e & 1 == 1 {
+            acc = (acc * base) % Q;
+        }
+        base = (base * base) % Q;
+        e >>= 1;
+    }
+    acc
 }
 
 /// FIPS 203 Algorithm 9: NTT.
@@ -98,14 +106,20 @@ pub fn ntt(f: &mut Poly) {
         while start < N {
             let zeta = ZETAS[i];
             i += 1;
-            for j in start..start + len {
-                let t = mul(zeta, f[j + len]);
-                f[j + len] = sub(f[j], t);
-                f[j] = add(f[j], t);
-            }
+            butterfly(f, start, len, zeta);
             start += 2 * len;
         }
         len /= 2;
+    }
+}
+
+/// One row of the forward butterfly: the `j`/`j + len` pair in a block.
+#[inline(always)]
+fn butterfly(f: &mut Poly, start: usize, len: usize, zeta: i16) {
+    for j in start..start + len {
+        let t = mul(zeta, f[j + len]);
+        f[j + len] = sub(f[j], t);
+        f[j] = add(f[j], t);
     }
 }
 
@@ -119,17 +133,23 @@ pub fn intt(f: &mut Poly) {
         while start < N {
             let zeta = ZETAS[i];
             i = i.wrapping_sub(1);
-            for j in start..start + len {
-                let t = f[j];
-                f[j] = add(t, f[j + len]);
-                f[j + len] = mul(zeta, sub(f[j + len], t));
-            }
+            inverse_butterfly(f, start, len, zeta);
             start += 2 * len;
         }
         len *= 2;
     }
     for c in f.iter_mut() {
         *c = mul(*c, 3303);
+    }
+}
+
+/// One row of the inverse butterfly: the `j`/`j + len` pair in a block.
+#[inline(always)]
+fn inverse_butterfly(f: &mut Poly, start: usize, len: usize, zeta: i16) {
+    for j in start..start + len {
+        let t = f[j];
+        f[j] = add(t, f[j + len]);
+        f[j + len] = mul(zeta, sub(f[j + len], t));
     }
 }
 

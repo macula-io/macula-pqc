@@ -1,0 +1,6 @@
+# Hard limits on a function's shape, denied in Cargo.toml's [workspace.lints]
+# and so gated by the clippy run in scripts/test.sh (`-D warnings`):
+# nesting depth, cognitive complexity, and function length.
+excessive-nesting-threshold = 3
+cognitive-complexity-threshold = 15
+too-many-lines-threshold = 60

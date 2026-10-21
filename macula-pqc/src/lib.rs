@@ -308,18 +308,23 @@ mod tests {
         }
     }
 
+    /// Every group in one builder's locked list is post-quantum.
+    fn assert_only_post_quantum(builder: &str, groups: &[&dyn SupportedKxGroup]) {
+        for group in groups {
+            assert!(
+                is_post_quantum(group.name()),
+                "{builder}: {:?} is offered and is classical",
+                group.name()
+            );
+        }
+    }
+
     /// The property itself, independent of the exact list, so a later
     /// change to the list still has to keep it.
     #[test]
     fn nothing_classical_is_offered() {
         for (builder, groups) in locked_lists() {
-            for group in groups {
-                assert!(
-                    is_post_quantum(group.name()),
-                    "{builder}: {:?} is offered and is classical",
-                    group.name()
-                );
-            }
+            assert_only_post_quantum(builder, &groups);
         }
     }
 
@@ -722,12 +727,7 @@ mod tests {
         );
         // Far more flights than TLS 1.3 needs, including a HelloRetryRequest;
         // bounds a handshake that stops making progress.
-        for _ in 0..20 {
-            let moved = pump(&mut client, &mut server)? + pump(&mut server, &mut client)?;
-            if moved == 0 && !client.is_handshaking() && !server.is_handshaking() {
-                break;
-            }
-        }
+        pump_until_settled(&mut client, &mut server)?;
         if client.is_handshaking() || server.is_handshaking() {
             return Err("handshake never completed".to_string());
         }
@@ -736,6 +736,18 @@ mod tests {
             (Some(c), Some(s)) if c == s => Ok(c),
             other => Err(format!("the two sides disagree on the group: {other:?}")),
         }
+    }
+
+    /// Move the handshake along until neither side has anything left to
+    /// say, or the flight budget is spent.
+    fn pump_until_settled(client: &mut Connection, server: &mut Connection) -> Result<(), String> {
+        let mut flights = 0;
+        let mut moved = 1;
+        while flights < 20 && (moved > 0 || client.is_handshaking() || server.is_handshaking()) {
+            moved = pump(client, server)? + pump(server, client)?;
+            flights += 1;
+        }
+        Ok(())
     }
 
     /// Moves what `from` wants to send into `to`; returns the bytes moved.

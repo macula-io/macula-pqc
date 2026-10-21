@@ -24,3 +24,6 @@ macula-mldsa = { workspace = true, features = ["internal"] }
 # QUIC config building, as macula_quic does it: quinn takes the QUIC Initial
 # suite from the provider, so a provider change must be proven against it.
 quinn-proto = { version = "0.11.18", default-features = false, features = ["rustls-aws-lc-rs"] }
+
+[lints]
+workspace = true

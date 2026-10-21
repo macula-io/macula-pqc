@@ -19,15 +19,20 @@ fn encode_then_decode_is_the_identity() {
         let bound = if d == 12 { Q as u32 } else { 1u32 << d };
         for _ in 0..16 {
             let mut f = [0i16; 256];
-            for c in f.iter_mut() {
-                *c = lcg(&mut seed, bound);
-            }
+            fill_from_lcg(&mut f, &mut seed, bound);
             // A DIRTY buffer: the encoder ORs bits in, so it must clear
             // what the caller's buffer held before.
             let mut bytes = vec![0xaau8; 32 * d];
             byte_encode(d, &f, &mut bytes);
             assert_eq!(byte_decode(d, &bytes), f, "d = {d}");
         }
+    }
+}
+
+/// Fill a polynomial with values below `bound` from the test generator.
+fn fill_from_lcg(f: &mut [i16; 256], seed: &mut u64, bound: u32) {
+    for c in f.iter_mut() {
+        *c = lcg(seed, bound);
     }
 }
 
@@ -39,11 +44,10 @@ fn decompress_of_compress_stays_within_the_stated_error_bound() {
         let bound = (Q as f64 / (1u32 << (d + 1)) as f64).round() as i32;
         for x in 0..Q as i16 {
             let back = decompress(d, compress(d, x)) as i32;
-            let mut err = (back - x as i32).abs();
-            // The ring wraps: an error of q-1 is an error of 1.
-            if err > Q / 2 {
-                err = Q - err;
-            }
+            // The ring wraps: an error of q-1 is an error of 1, so the
+            // smaller of the two directions is the real error.
+            let err = (back - x as i32).abs();
+            let err = err.min(Q - err);
             assert!(
                 err <= bound,
                 "d = {d}, x = {x}: error {err} exceeds the bound {bound}"
@@ -94,14 +98,20 @@ fn byte_decode_12_reduces_every_12_bit_value() {
         let mut bytes = vec![0u8; 384];
         let mut bit = 0usize;
         for &v in raw.iter() {
-            for b in 0..12 {
-                bytes[bit / 8] |= (((v >> b) & 1) as u8) << (bit % 8);
-                bit += 1;
-            }
+            pack_12_bits(&mut bytes, v, &mut bit);
         }
         f.copy_from_slice(&byte_decode(12, &bytes));
         for (i, &c) in f.iter().enumerate() {
             assert_eq!(c as u32, raw[i] % Q as u32, "raw value {}", raw[i]);
         }
+    }
+}
+
+/// Write `v` as twelve little-endian bits from `bit` on, ORed into `bytes`
+/// at whatever byte boundaries they land on.
+fn pack_12_bits(bytes: &mut [u8], v: u32, bit: &mut usize) {
+    for b in 0..12 {
+        bytes[*bit / 8] |= (((v >> b) & 1) as u8) << (*bit % 8);
+        *bit += 1;
     }
 }

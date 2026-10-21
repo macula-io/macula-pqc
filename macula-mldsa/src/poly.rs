@@ -71,26 +71,36 @@ const fn build_zetas() -> [i32; N] {
     let mut out = [0i32; N];
     let mut k = 1;
     while k < N {
-        let mut r = 0usize;
-        let mut b = 0;
-        while b < 8 {
-            r |= ((k >> b) & 1) << (7 - b);
-            b += 1;
-        }
-        let mut acc: u64 = 1;
-        let mut base: u64 = 1753;
-        let mut e = r;
-        while e > 0 {
-            if e & 1 == 1 {
-                acc = acc * base % Q as u64;
-            }
-            base = base * base % Q as u64;
-            e >>= 1;
-        }
-        out[k] = acc as i32;
+        out[k] = pow1753(bit_rev8(k));
         k += 1;
     }
     out
+}
+
+/// The eight-bit reversal of `k`, FIPS 204's `BitRev8`.
+const fn bit_rev8(k: usize) -> usize {
+    let mut r = 0usize;
+    let mut b = 0;
+    while b < 8 {
+        r |= ((k >> b) & 1) << (7 - b);
+        b += 1;
+    }
+    r
+}
+
+/// `1753^r mod q` by square and multiply.
+const fn pow1753(r: usize) -> i32 {
+    let mut acc: u64 = 1;
+    let mut base: u64 = 1753;
+    let mut e = r;
+    while e > 0 {
+        if e & 1 == 1 {
+            acc = acc * base % Q as u64;
+        }
+        base = base * base % Q as u64;
+        e >>= 1;
+    }
+    acc as i32
 }
 
 /// FIPS 204 Algorithm 41, `NTT`, in place.
@@ -102,14 +112,20 @@ pub fn ntt(w: &mut Poly) {
         while start < N {
             m += 1;
             let z = ZETAS[m];
-            for j in start..start + len {
-                let t = mul(z, w[j + len]);
-                w[j + len] = sub(w[j], t);
-                w[j] = add(w[j], t);
-            }
+            butterfly(w, start, len, z);
             start += 2 * len;
         }
         len /= 2;
+    }
+}
+
+/// One row of the forward butterfly: the `j`/`j + len` pair in a block.
+#[inline(always)]
+fn butterfly(w: &mut Poly, start: usize, len: usize, z: i32) {
+    for j in start..start + len {
+        let t = mul(z, w[j + len]);
+        w[j + len] = sub(w[j], t);
+        w[j] = add(w[j], t);
     }
 }
 
@@ -121,13 +137,7 @@ pub fn ntt_inverse(w: &mut Poly) {
         let mut start = 0;
         while start < N {
             m -= 1;
-            let z = Q - ZETAS[m];
-            for j in start..start + len {
-                let t = w[j];
-                w[j] = add(t, w[j + len]);
-                w[j + len] = sub(t, w[j + len]);
-                w[j + len] = mul(z, w[j + len]);
-            }
+            inverse_butterfly(w, start, len, Q - ZETAS[m]);
             start += 2 * len;
         }
         len *= 2;
@@ -136,6 +146,16 @@ pub fn ntt_inverse(w: &mut Poly) {
     const F: i32 = 8347681;
     for c in w.iter_mut() {
         *c = mul(F, *c);
+    }
+}
+
+/// One row of the inverse butterfly: the `j`/`j + len` pair in a block.
+#[inline(always)]
+fn inverse_butterfly(w: &mut Poly, start: usize, len: usize, z: i32) {
+    for j in start..start + len {
+        let t = w[j];
+        w[j] = add(t, w[j + len]);
+        w[j + len] = mul(z, sub(t, w[j + len]));
     }
 }
 
@@ -363,25 +383,38 @@ mod tests {
         }
     }
 
+    /// The standard's own Decompose, written with `%` and `/` as FIPS 204
+    /// states it, which is what [`decompose`] is checked against.
+    fn standard_decompose(r: i32, gamma2: i32) -> (i32, i32) {
+        let alpha = 2 * gamma2;
+        let mut r0 = r % alpha;
+        if r0 > gamma2 {
+            r0 -= alpha;
+        }
+        if r - r0 == Q - 1 {
+            return (0, r0 - 1);
+        }
+        ((r - r0) / alpha, r0)
+    }
+
     /// The standard's own Decompose, with `%` and `/`, for every `r` in
     /// `[0, q)` at both values of gamma2: the branch-free one must agree
     /// everywhere, the special case at `r1 = m` included.
     #[test]
     fn decompose_agrees_with_the_standard_for_every_r() {
         for gamma2 in [(Q - 1) / 88, (Q - 1) / 32] {
-            let alpha = 2 * gamma2;
-            for r in 0..Q {
-                let mut r0 = r % alpha;
-                if r0 > gamma2 {
-                    r0 -= alpha;
-                }
-                let want = if r - r0 == Q - 1 {
-                    (0, r0 - 1)
-                } else {
-                    ((r - r0) / alpha, r0)
-                };
-                assert_eq!(decompose(r, gamma2), want, "gamma2 {gamma2}, r {r}");
-            }
+            every_r_agrees(gamma2);
+        }
+    }
+
+    /// Every `r` in `[0, q)` at one `gamma2`.
+    fn every_r_agrees(gamma2: i32) {
+        for r in 0..Q {
+            assert_eq!(
+                decompose(r, gamma2),
+                standard_decompose(r, gamma2),
+                "gamma2 {gamma2}, r {r}"
+            );
         }
     }
 

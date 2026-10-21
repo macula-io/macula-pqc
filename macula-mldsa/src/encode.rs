@@ -148,19 +148,28 @@ pub fn hint_bit_unpack(y: &[u8], p: ParameterSet) -> Option<Box<[Poly; K_MAX]>> 
         if end < index || end > omega {
             return None;
         }
-        let first = index;
-        while index < end {
-            if index > first && y[index - 1] >= y[index] {
-                return None;
-            }
-            poly[y[index] as usize] = 1;
-            index += 1;
-        }
+        hint_positions(poly, y, index, end)?;
+        index = end;
     }
     if y[index..omega].iter().any(|&b| b != 0) {
         return None;
     }
     Some(h)
+}
+
+/// The `first..end` run of one polynomial's positions in `y`: `None` when
+/// they are not strictly increasing, or when `y[index - 1]` and `y[index]`
+/// here are out of order.
+fn hint_positions(poly: &mut Poly, y: &[u8], first: usize, end: usize) -> Option<()> {
+    let mut index = first;
+    while index < end {
+        if index > first && y[index - 1] >= y[index] {
+            return None;
+        }
+        poly[y[index] as usize] = 1;
+        index += 1;
+    }
+    Some(())
 }
 
 /// A decoded signature: the commitment hash, the response `z` held mod q,

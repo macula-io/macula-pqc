@@ -6,7 +6,7 @@
 //! about the coefficients kept; this is the shape FIPS 204 specifies, not
 //! a claim that the loop runs in constant time.
 
-use macula_keccak::{Shake128Reader, Shake256};
+use macula_keccak::{Shake128Reader, Shake256, Shake256Reader};
 use zeroize::Zeroize;
 
 use crate::encode::bit_unpack;
@@ -38,19 +38,25 @@ pub fn rej_ntt_poly(seed: &[u8; 34]) -> Poly {
     let mut block = [0u8; 168];
     while j < N {
         xof.read(&mut block);
-        for b in block.as_chunks::<3>().0 {
-            if j == N {
-                break;
-            }
-            // Algorithm 14: the top bit of the third byte is cleared.
-            let z = b[0] as i32 | (b[1] as i32) << 8 | ((b[2] & 0x7f) as i32) << 16;
-            if z < Q {
-                a[j] = z;
-                j += 1;
-            }
-        }
+        take_ntt_coeffs(&mut a, &mut j, &block);
     }
     a
+}
+
+/// Take the coefficients one block offers, three bytes at a time, until
+/// the block is spent or the polynomial is full.
+fn take_ntt_coeffs(a: &mut Poly, j: &mut usize, block: &[u8; 168]) {
+    for b in block.as_chunks::<3>().0 {
+        if *j == N {
+            break;
+        }
+        // Algorithm 14: the top bit of the third byte is cleared.
+        let z = b[0] as i32 | (b[1] as i32) << 8 | ((b[2] & 0x7f) as i32) << 16;
+        if z < Q {
+            a[*j] = z;
+            *j += 1;
+        }
+    }
 }
 
 /// FIPS 204 Algorithm 15, `CoeffFromHalfByte`, for `eta` in `{2, 4}`.
@@ -79,21 +85,33 @@ pub fn rej_bounded_poly(a: &mut Poly, rho_prime: &[u8; 64], nonce: u16, eta: i32
     let mut block = [0u8; 136];
     while j < N {
         xof.read(&mut block);
-        for &z in block.iter() {
-            for half in [z & 15, z >> 4] {
-                if j < N {
-                    if let Some(v) = coeff_from_half_byte(half, eta) {
-                        a[j] = from_signed(v);
-                        j += 1;
-                    }
-                }
-            }
-            if j == N {
-                break;
-            }
-        }
+        take_bounded_coeffs(a, &mut j, &block, eta);
     }
     block.zeroize();
+}
+
+/// Take the coefficients one block offers, a half-byte at a time, until
+/// the block is spent or the polynomial is full.
+fn take_bounded_coeffs(a: &mut Poly, j: &mut usize, block: &[u8; 136], eta: i32) {
+    for &z in block.iter() {
+        if *j == N {
+            return;
+        }
+        take_halves(a, j, z, eta);
+    }
+}
+
+/// The two `CoeffFromHalfByte` draws in one block byte.
+fn take_halves(a: &mut Poly, j: &mut usize, z: u8, eta: i32) {
+    for half in [z & 15, z >> 4] {
+        if *j == N {
+            return;
+        }
+        if let Some(v) = coeff_from_half_byte(half, eta) {
+            a[*j] = from_signed(v);
+            *j += 1;
+        }
+    }
 }
 
 /// FIPS 204 Algorithm 32, `ExpandA`: `A[r][s] = RejNTTPoly(rho || s || r)`.
@@ -140,14 +158,7 @@ pub fn sample_in_ball(c_tilde: &[u8], tau: usize) -> Poly {
     let signs = u64::from_le_bytes(s);
     let mut c = [0i32; N];
     for i in (N - tau)..N {
-        let mut j = [0u8; 1];
-        loop {
-            xof.read(&mut j);
-            if j[0] as usize <= i {
-                break;
-            }
-        }
-        let j = j[0] as usize;
+        let j = position_below(&mut xof, i);
         c[i] = c[j];
         c[j] = if (signs >> (i + tau - N)) & 1 == 1 {
             Q - 1
@@ -156,6 +167,17 @@ pub fn sample_in_ball(c_tilde: &[u8], tau: usize) -> Poly {
         };
     }
     c
+}
+
+/// Algorithm 29's rejection loop: the next byte that is `<= i`.
+fn position_below(xof: &mut Shake256Reader, i: usize) -> usize {
+    let mut j = [0u8; 1];
+    loop {
+        xof.read(&mut j);
+        if j[0] as usize <= i {
+            return j[0] as usize;
+        }
+    }
 }
 
 /// FIPS 204 Algorithm 34, `ExpandMask`: `y[r] = BitUnpack(H(rho'' ||
@@ -188,19 +210,33 @@ mod tests {
     #[test]
     fn expand_mask_moves_with_its_counter() {
         for p in [ML_DSA_44, ML_DSA_87] {
-            let seed = [0x42u8; 64];
-            let mut y = [[0i32; N]; L_MAX];
-            expand_mask(&mut y, &seed, 10, p);
-            for (r, poly) in y.iter().enumerate().take(p.l) {
-                let mut shifted = [[0i32; N]; L_MAX];
-                expand_mask(&mut shifted, &seed, 10 + r as u16, p);
-                assert_eq!(*poly, shifted[0], "{}: y[{r}]", p.name);
-            }
-            let mut next = [[0i32; N]; L_MAX];
-            expand_mask(&mut next, &seed, 10 + p.l as u16, p);
-            for (r, (a, b)) in y.iter().zip(next.iter()).enumerate().take(p.l) {
-                assert_ne!(a, b, "{}: the next attempt repeats y[{r}]", p.name);
-            }
+            counter_moves_the_mask(p);
         }
+    }
+
+    /// One parameter set's masks: every `y[r]` is `y[0]` at `kappa + r`,
+    /// and the next attempt's is new.
+    fn counter_moves_the_mask(p: crate::ParameterSet) {
+        let seed = [0x42u8; 64];
+        let mut y = [[0i32; N]; L_MAX];
+        expand_mask(&mut y, &seed, 10, p);
+        let mut next = [[0i32; N]; L_MAX];
+        expand_mask(&mut next, &seed, 10 + p.l as u16, p);
+        for (r, (poly, after)) in y.iter().zip(next.iter()).enumerate().take(p.l) {
+            assert_eq!(
+                *poly,
+                mask_at(&seed, 10 + r as u16, p),
+                "{}: y[{r}]",
+                p.name
+            );
+            assert_ne!(poly, after, "{}: the next attempt repeats y[{r}]", p.name);
+        }
+    }
+
+    /// The mask at one counter value, on its own.
+    fn mask_at(seed: &[u8; 64], kappa: u16, p: crate::ParameterSet) -> [i32; N] {
+        let mut shifted = [[0i32; N]; L_MAX];
+        expand_mask(&mut shifted, seed, kappa, p);
+        shifted[0]
     }
 }

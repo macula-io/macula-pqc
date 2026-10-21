@@ -348,25 +348,34 @@ mod tests {
     fn counting() -> impl FnMut(&mut [u8]) -> Result<(), Error> {
         let mut next = 0u8;
         move |buf| {
-            for b in buf.iter_mut() {
-                *b = next;
-                next = next.wrapping_add(1);
-            }
+            fill_counting(buf, &mut next);
             Ok(())
+        }
+    }
+
+    /// The bytes `counting` hands out, in order across calls.
+    fn fill_counting(buf: &mut [u8], next: &mut u8) {
+        for b in buf.iter_mut() {
+            *b = *next;
+            *next = next.wrapping_add(1);
         }
     }
 
     /// A source that works `ok` times and then fails.
     fn failing_after(ok: usize) -> impl FnMut(&mut [u8]) -> Result<(), Error> {
         let mut calls = 0;
-        move |buf| {
-            calls += 1;
-            if calls > ok {
-                return Err(Error::RandomnessUnavailable);
-            }
-            buf.fill(0x42);
-            Ok(())
+        move |buf| draw_until_failure(ok, &mut calls, buf)
+    }
+
+    /// One draw from `failing_after`: count it, and fail once `ok` draws
+    /// have already succeeded.
+    fn draw_until_failure(ok: usize, calls: &mut usize, buf: &mut [u8]) -> Result<(), Error> {
+        *calls += 1;
+        if *calls > ok {
+            return Err(Error::RandomnessUnavailable);
         }
+        buf.fill(0x42);
+        Ok(())
     }
 
     /// The drawn bytes ARE the seeds: `d` first, then `z`, as FIPS 203
@@ -406,19 +415,24 @@ mod tests {
     #[test]
     fn a_failing_source_is_an_error_not_a_key() {
         for p in SETS {
-            for ok in [0, 1] {
-                assert_eq!(
-                    key_gen_drawing_from(p, failing_after(ok)),
-                    Err(Error::RandomnessUnavailable),
-                    "{}: key_gen, source fails after {ok} draws",
-                    p.name
-                );
-            }
+            key_gen_from_a_failing_source_is_an_error(p);
             let (ek, _) = internal::key_gen(p, &[1; 32], &[2; 32]);
             assert_eq!(
                 encaps_drawing_from(p, &ek, failing_after(0)),
                 Err(Error::RandomnessUnavailable),
                 "{}: encaps",
+                p.name
+            );
+        }
+    }
+
+    /// A source failing after each of the two key-gen draws in turn.
+    fn key_gen_from_a_failing_source_is_an_error(p: ParameterSet) {
+        for ok in [0, 1] {
+            assert_eq!(
+                key_gen_drawing_from(p, failing_after(ok)),
+                Err(Error::RandomnessUnavailable),
+                "{}: key_gen, source fails after {ok} draws",
                 p.name
             );
         }

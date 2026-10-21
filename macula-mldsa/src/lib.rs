@@ -383,24 +383,30 @@ mod tests {
     #[test]
     fn a_key_or_signature_of_the_wrong_length_is_false() {
         for p in [ML_DSA_44, ML_DSA_65, ML_DSA_87] {
-            let (pk, len) = (vec![0u8; p.public_key_len()], p.signature_len());
-            for sig_len in [0, len - 1, len + 1] {
-                assert_eq!(
-                    verify(p, &pk, b"m", &vec![0u8; sig_len], b""),
-                    Ok(false),
-                    "{}",
-                    p.name
-                );
-            }
-            let sig = vec![0u8; len];
-            for pk_len in [0, pk.len() - 1, pk.len() + 1] {
-                assert_eq!(
-                    verify(p, &vec![0u8; pk_len], b"m", &sig, b""),
-                    Ok(false),
-                    "{}",
-                    p.name
-                );
-            }
+            wrong_lengths_are_false(p);
+        }
+    }
+
+    /// Every length one byte either side of the real one, for `pk` and for
+    /// `sig`, at one parameter set.
+    fn wrong_lengths_are_false(p: crate::ParameterSet) {
+        let len = p.signature_len();
+        let (pk, sig) = (vec![0u8; p.public_key_len()], vec![0u8; len]);
+        for bad in [0, len - 1, len + 1] {
+            assert_eq!(
+                verify(p, &pk, b"m", &vec![0u8; bad], b""),
+                Ok(false),
+                "{}",
+                p.name
+            );
+        }
+        for bad in [0, pk.len() - 1, pk.len() + 1] {
+            assert_eq!(
+                verify(p, &vec![0u8; bad], b"m", &sig, b""),
+                Ok(false),
+                "{}",
+                p.name
+            );
         }
     }
 

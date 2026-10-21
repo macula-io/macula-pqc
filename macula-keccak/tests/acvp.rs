@@ -82,13 +82,18 @@ fn expected(dir: &str) -> BTreeMap<u64, String> {
     let mut out = BTreeMap::new();
     for g in e["testGroups"].as_array().unwrap() {
         for t in g["tests"].as_array().unwrap() {
-            // MCT tests carry a `resultsArray`, not an `md`.
-            if let Some(md) = t.get("md").and_then(|v| v.as_str()) {
-                out.insert(t["tcId"].as_u64().unwrap(), md.to_ascii_lowercase());
-            }
+            add_expected(&mut out, t);
         }
     }
     out
+}
+
+/// One expected result. MCT tests carry a `resultsArray`, not an `md`, and
+/// are added by their own path.
+fn add_expected(out: &mut BTreeMap<u64, String>, t: &serde_json::Value) {
+    if let Some(md) = t.get("md").and_then(|v| v.as_str()) {
+        out.insert(t["tcId"].as_u64().unwrap(), md.to_ascii_lowercase());
+    }
 }
 
 /// Runs every AFT and VOT test in a directory, returning how many ran.
@@ -108,38 +113,53 @@ fn run(dir: &str, f: &dyn Fn(&[u8], usize) -> Vec<u8>) -> usize {
             "unhandled group type {tt} in {dir}"
         );
         for t in g["tests"].as_array().unwrap() {
-            let tc = t["tcId"].as_u64().unwrap();
-            let Some(msg) = message(t) else { continue };
-            // SHAKE output lengths are in BITS too, and are not always a
-            // multiple of 8. A partial final byte is a bit-oriented case
-            // and is skipped for the same reason as a bit-oriented input.
-            if t.get("outLen")
-                .and_then(|v| v.as_u64())
-                .is_some_and(|b| !b.is_multiple_of(8))
-            {
-                continue;
-            }
-            // SHA-3 has a fixed output; SHAKE carries its length per test.
-            let out_bytes = t
-                .get("outLen")
-                .and_then(|v| v.as_u64())
-                .map(|b| b as usize / 8)
-                .unwrap_or(0);
-            let got = f(&msg, out_bytes);
-            let want = exp
-                .get(&tc)
-                .unwrap_or_else(|| panic!("no expected for tcId {tc}"));
-            assert_eq!(
-                hex_of(&got),
-                *want,
-                "{dir} tcId {tc}: msg {} bytes, out {out_bytes} bytes",
-                msg.len()
-            );
-            ran += 1;
+            ran += check_one(dir, &exp, t, f);
         }
     }
     assert!(ran > 0, "{dir} ran no tests");
     ran
+}
+
+/// One AFT/VOT test against its expected digest: 1 when it ran, 0 when it
+/// is skipped by name (a SHAKE length that is not a whole number of bytes).
+fn check_one(
+    dir: &str,
+    exp: &BTreeMap<u64, String>,
+    t: &serde_json::Value,
+    f: &dyn Fn(&[u8], usize) -> Vec<u8>,
+) -> usize {
+    let tc = t["tcId"].as_u64().unwrap();
+    let Some(msg) = message(t) else { return 0 };
+    // SHAKE output lengths are in BITS too, and are not always a multiple
+    // of 8. A partial final byte is a bit-oriented case and is skipped for
+    // the same reason as a bit-oriented input.
+    if bit_oriented_out(t) {
+        return 0;
+    }
+    // SHA-3 has a fixed output; SHAKE carries its length per test.
+    let out_bytes = t
+        .get("outLen")
+        .and_then(|v| v.as_u64())
+        .map(|b| b as usize / 8)
+        .unwrap_or(0);
+    let got = f(&msg, out_bytes);
+    let want = exp
+        .get(&tc)
+        .unwrap_or_else(|| panic!("no expected for tcId {tc}"));
+    assert_eq!(
+        hex_of(&got),
+        *want,
+        "{dir} tcId {tc}: msg {} bytes, out {out_bytes} bytes",
+        msg.len()
+    );
+    1
+}
+
+/// A SHAKE output length that is not a whole number of bytes.
+fn bit_oriented_out(t: &serde_json::Value) -> bool {
+    t.get("outLen")
+        .and_then(|v| v.as_u64())
+        .is_some_and(|b| !b.is_multiple_of(8))
 }
 
 fn hex_of(b: &[u8]) -> String {
@@ -232,6 +252,15 @@ fn multi_block_coverage_exists_for_both_functions() {
     }
 }
 
+/// Squeeze `out` in `chunk`-byte pieces: `chunks_mut` splits it into
+/// whole chunks with the remainder last, so every piece but a short final
+/// one straddles a 168-byte block boundary.
+fn squeeze_in_chunks(r: &mut Shake128Reader, out: &mut [u8], chunk: usize) {
+    for piece in out.chunks_mut(chunk) {
+        r.read(piece);
+    }
+}
+
 /// The incremental reader must agree with the one-shot, squeezed in
 /// awkward chunk sizes that straddle block boundaries. ML-KEM reads this
 /// way because it cannot know in advance how many bytes it needs.
@@ -245,12 +274,7 @@ fn incremental_reader_agrees_with_one_shot_across_block_boundaries() {
         for chunk in [1usize, 7, 168, 200] {
             let mut r = Shake128Reader::new(msg);
             let mut got = vec![0u8; total];
-            let mut off = 0;
-            while off < total {
-                let n = core::cmp::min(chunk, total - off);
-                r.read(&mut got[off..off + n]);
-                off += n;
-            }
+            squeeze_in_chunks(&mut r, &mut got, chunk);
             assert_eq!(got, want, "total {total}, chunk {chunk}");
         }
     }
@@ -273,6 +297,13 @@ fn shake256_in_pieces(msg: &[u8], out_len: usize, absorb: usize, squeeze: usize)
     out
 }
 
+/// One absorb/squeeze profile against a SHAKE256 vector directory, returning
+/// how many cases ran. Hoisted out of the sweep so the closure that binds the
+/// profile is not nested inside two loops.
+fn run_shake256_in_pieces(dir: &str, absorb: usize, squeeze: usize) -> usize {
+    run(dir, &|m, o| shake256_in_pieces(m, o, absorb, squeeze))
+}
+
 /// ⛔ ML-DSA hashes through SHAKE256 in pieces on both sides: it absorbs
 /// a secret key, its randomness and a message as separate inputs rather
 /// than concatenating them into a buffer that would need wiping, and it
@@ -283,13 +314,9 @@ fn shake256_in_pieces(msg: &[u8], out_len: usize, absorb: usize, squeeze: usize)
 fn incremental_shake256_matches_acvp_absorbed_and_squeezed_in_pieces() {
     for absorb in [1usize, 7, 135, 136, 137] {
         for squeeze in [1usize, 7, 136, 200] {
-            let n = run("SHAKE-256-1.0", &|m, o| {
-                shake256_in_pieces(m, o, absorb, squeeze)
-            });
+            let n = run_shake256_in_pieces("SHAKE-256-1.0", absorb, squeeze);
             assert_eq!(n, 210, "absorb {absorb}, squeeze {squeeze}");
-            run("SHAKE-256-FIPS202", &|m, o| {
-                shake256_in_pieces(m, o, absorb, squeeze)
-            });
+            run_shake256_in_pieces("SHAKE-256-FIPS202", absorb, squeeze);
         }
     }
 }
